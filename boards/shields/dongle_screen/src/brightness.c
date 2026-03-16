@@ -2,6 +2,8 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/led.h>
+#include <zephyr/drivers/display.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/keycode_state_changed.h>
@@ -48,6 +50,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 static const struct device *pwm_leds_dev = DEVICE_DT_GET_ONE(pwm_leds);
 #define DISP_BL DT_NODE_CHILD_IDX(DT_NODELABEL(disp_bl))
+
+static const struct device *display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 
 static int64_t last_activity = 0;
 static uint8_t max_brightness = CONFIG_DONGLE_SCREEN_MAX_BRIGHTNESS;
@@ -321,6 +325,8 @@ static void screen_set_on(bool on)
             LOG_DBG("SCREEN TURN ON: Adjusted brightness to ensure screen can turn on: %d", current_brightness);
         }
 
+        // Wake the display controller before turning on the backlight
+        pm_device_action_run(display_dev, PM_DEVICE_ACTION_RESUME);
         fade_to_brightness(0, clamp_brightness(current_brightness + brightness_modifier));
         screen_on = true;
         off_through_modifier = false; // Reset the flag, because the screen is turned on again
@@ -330,6 +336,8 @@ static void screen_set_on(bool on)
     {
         fade_to_brightness(clamp_brightness(current_brightness + brightness_modifier), 0);
         screen_on = false;
+        // Put the display controller to sleep after the backlight has faded out
+        pm_device_action_run(display_dev, PM_DEVICE_ACTION_SUSPEND);
         LOG_INF("Screen off (smooth)");
     }
     else
@@ -503,8 +511,8 @@ static int key_listener(const zmk_event_t *eh)
     last_activity = k_uptime_get();
     if (!screen_on && !off_through_modifier)
     {
-        screen_set_on(true);
         k_wakeup(screen_idle_tid);
+        screen_set_on(true);
     }
 #else
     // Without idle thread: just turn on screen
