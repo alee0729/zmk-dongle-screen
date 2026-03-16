@@ -287,7 +287,15 @@ void fade_thread(void)
             // screen_set_on) ensures SLEEP_IN is only sent once the backlight
             // is already at 0 and the fade animation has completed, preventing
             // a race where LVGL is still rendering when SUSPEND fires.
-            if (req.suspend_after_fade && req.to == 0)
+            //
+            // Guard with !screen_on: if screen_set_on(true) was called while
+            // this fade was in flight, pm_device_action_run(RESUME) was called
+            // first but Zephyr rejected it with -EALREADY (display was still
+            // ACTIVE, SUSPEND hadn't fired yet).  Without this guard, SUSPEND
+            // would fire anyway, leaving the display sleeping while screen_on
+            // is true — a blank/frozen display with no recovery path short of
+            // a power cycle.
+            if (req.suspend_after_fade && req.to == 0 && !screen_on)
             {
                 pm_device_action_run(display_dev, PM_DEVICE_ACTION_SUSPEND);
             }
@@ -295,10 +303,13 @@ void fade_thread(void)
     }
 }
 
-// Launch the fade thread with 768 bytes of stack, medium priority (6)
-// 512 was too small for logging, math (float, int), small loop, few stack-local variables
-// 768 is just a guess, optimization is possible, probably
-K_THREAD_DEFINE(fade_tid, 768, fade_thread, NULL, NULL, NULL, 6, 0, 0);
+// Launch the fade thread with 1536 bytes of stack, medium priority (6)
+// The thread now calls pm_device_action_run(SUSPEND) which adds a deep SPI
+// call chain (pm_device_action_run → st7789v_pm_action → st7789v_transmit →
+// nRF SPIM driver with DMA setup).  Estimated peak stack depth is ~600 bytes;
+// 1536 bytes provides a safe margin and accommodates the FPU context save
+// (~128 bytes), logging overhead, and Zephyr's 8-byte stack sentinel.
+K_THREAD_DEFINE(fade_tid, 1536, fade_thread, NULL, NULL, NULL, 6, 0, 0);
 
 // Function to submit a brightness fade request
 // Ensures that only the most recent fade request is applied by purging the queue first for changes in between animations
