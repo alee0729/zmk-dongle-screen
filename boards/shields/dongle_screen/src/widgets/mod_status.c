@@ -49,7 +49,7 @@ static void update_mod_status(struct zmk_widget_mod_status *widget)
  * will eventually corrupt LVGL's heap, causing a hard-fault lockup. */
 static void mod_status_lv_timer_cb(lv_timer_t *timer)
 {
-    struct zmk_widget_mod_status *widget = lv_timer_get_user_data(timer);
+    struct zmk_widget_mod_status *widget = timer->user_data;
     update_mod_status(widget);
 }
 
