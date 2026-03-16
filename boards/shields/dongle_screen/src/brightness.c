@@ -210,7 +210,13 @@ struct fade_request_t
     uint8_t from;              // Starting brightness level
     uint8_t to;                // Target brightness level
     bool suspend_after_fade;   // If true, call PM SUSPEND on display after fade to 0 completes
+    uint8_t _pad;              // Explicit padding: sizeof == 4, satisfying K_MSGQ 4-byte alignment
 };
+
+// screen_on tracks whether the display is currently active.  Declared here at
+// file scope (outside the IDLE_TIMEOUT / KEYBOARD_CONTROL #if block below)
+// because fade_thread references it to guard the deferred PM SUSPEND call.
+static bool screen_on = true;
 
 #define FADE_QUEUE_SIZE 4
 
@@ -331,9 +337,7 @@ void set_screen_brightness(uint8_t value, bool ambient)
 }
 
 #if CONFIG_DONGLE_SCREEN_IDLE_TIMEOUT_S > 0 || CONFIG_DONGLE_SCREEN_BRIGHTNESS_KEYBOARD_CONTROL
-// --- Brightness logic ---
-static bool screen_on = true;
-// --- Screen on/off ---
+// --- Brightness logic / Screen on/off ---
 
 static void screen_set_on(bool on)
 {
