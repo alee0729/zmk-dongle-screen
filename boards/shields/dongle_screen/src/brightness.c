@@ -207,8 +207,9 @@ static bool should_screen_turn_on(uint8_t base_brightness, int8_t modifier)
 // Contains starting and target brightness levels to be animated
 struct fade_request_t
 {
-    uint8_t from; // Starting brightness level
-    uint8_t to;   // Target brightness level
+    uint8_t from;              // Starting brightness level
+    uint8_t to;                // Target brightness level
+    bool suspend_after_fade;   // If true, call PM SUSPEND on display after fade to 0 completes
 };
 
 #define FADE_QUEUE_SIZE 4
@@ -280,6 +281,16 @@ void fade_thread(void)
             {
                 apply_brightness(req.to);
             }
+
+            // After fading the backlight fully off, put the display controller
+            // to sleep.  Doing this here (rather than immediately in
+            // screen_set_on) ensures SLEEP_IN is only sent once the backlight
+            // is already at 0 and the fade animation has completed, preventing
+            // a race where LVGL is still rendering when SUSPEND fires.
+            if (req.suspend_after_fade && req.to == 0)
+            {
+                pm_device_action_run(display_dev, PM_DEVICE_ACTION_SUSPEND);
+            }
         }
     }
 }
@@ -291,9 +302,9 @@ K_THREAD_DEFINE(fade_tid, 768, fade_thread, NULL, NULL, NULL, 6, 0, 0);
 
 // Function to submit a brightness fade request
 // Ensures that only the most recent fade request is applied by purging the queue first for changes in between animations
-static void fade_to_brightness(uint8_t from, uint8_t to)
+static void fade_to_brightness(uint8_t from, uint8_t to, bool suspend_after_fade)
 {
-    struct fade_request_t req = {.from = from, .to = to};
+    struct fade_request_t req = {.from = from, .to = to, .suspend_after_fade = suspend_after_fade};
     k_msgq_purge(&fade_msgq);                // Clear any pending fades to avoid outdated transitions
     k_msgq_put(&fade_msgq, &req, K_NO_WAIT); // Submit the new fade request without blocking
 }
@@ -304,7 +315,7 @@ void set_screen_brightness(uint8_t value, bool ambient)
 
     uint8_t current_effective = clamp_brightness(current_brightness + brightness_modifier);
 
-    fade_to_brightness(current_effective, result.effective_brightness);
+    fade_to_brightness(current_effective, result.effective_brightness, false);
     current_brightness = result.adjusted_brightness;
 }
 
@@ -327,17 +338,17 @@ static void screen_set_on(bool on)
 
         // Wake the display controller before turning on the backlight
         pm_device_action_run(display_dev, PM_DEVICE_ACTION_RESUME);
-        fade_to_brightness(0, clamp_brightness(current_brightness + brightness_modifier));
+        fade_to_brightness(0, clamp_brightness(current_brightness + brightness_modifier), false);
         screen_on = true;
         off_through_modifier = false; // Reset the flag, because the screen is turned on again
         LOG_INF("Screen on (smooth)");
     }
     else if (!on && screen_on)
     {
-        fade_to_brightness(clamp_brightness(current_brightness + brightness_modifier), 0);
+        // Pass suspend_after_fade=true so fade_thread sends SLEEP_IN only after
+        // the backlight reaches 0, avoiding a race with in-flight LVGL renders.
+        fade_to_brightness(clamp_brightness(current_brightness + brightness_modifier), 0, true);
         screen_on = false;
-        // Put the display controller to sleep after the backlight has faded out
-        pm_device_action_run(display_dev, PM_DEVICE_ACTION_SUSPEND);
         LOG_INF("Screen off (smooth)");
     }
     else
@@ -551,6 +562,14 @@ static uint8_t ambient_to_brightness(int32_t sensor_value)
     {
         LOG_INF("Ambient sensor reading (%d) above DONGLE_SCREEN_AMBIENT_LIGHT_MAX_RAW_VALUE: (%d) Will set the sensor reading to the maximum configured.", sensor_value, CONFIG_DONGLE_SCREEN_AMBIENT_LIGHT_MAX_RAW_VALUE);
         sensor_value = max_sensor;
+    }
+
+    // Guard against division by zero when min and max sensor values are equal.
+    // The Kconfig check only prevents min > max, not min == max.  An equal
+    // range would cause a hard-fault on Cortex-M4 requiring a power cycle.
+    if (max_sensor == min_sensor)
+    {
+        return clamp_brightness(min_brightness);
     }
 
     uint8_t brightness = min_brightness +

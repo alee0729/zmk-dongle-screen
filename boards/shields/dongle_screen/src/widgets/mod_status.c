@@ -43,13 +43,15 @@ static void update_mod_status(struct zmk_widget_mod_status *widget)
     lv_label_set_text(widget->label, idx ? text : "");
 }
 
-static void mod_status_timer_cb(struct k_timer *timer)
+/* Use an LVGL timer so the callback fires from within lv_task_handler() in the
+ * display thread.  A plain k_timer expiry function runs in ISR context, which
+ * is not safe for any LVGL call (memory allocation, object mutation, etc.) and
+ * will eventually corrupt LVGL's heap, causing a hard-fault lockup. */
+static void mod_status_lv_timer_cb(lv_timer_t *timer)
 {
-    struct zmk_widget_mod_status *widget = k_timer_user_data_get(timer);
+    struct zmk_widget_mod_status *widget = lv_timer_get_user_data(timer);
     update_mod_status(widget);
 }
-
-static struct k_timer mod_status_timer;
 
 int zmk_widget_mod_status_init(struct zmk_widget_mod_status *widget, lv_obj_t *parent)
 {
@@ -61,9 +63,7 @@ int zmk_widget_mod_status_init(struct zmk_widget_mod_status *widget, lv_obj_t *p
     lv_label_set_text(widget->label, "-");
     lv_obj_set_style_text_font(widget->label, &NerdFonts_Regular_40, 0); // <-- NerdFont setzen
 
-    k_timer_init(&mod_status_timer, mod_status_timer_cb, NULL);
-    k_timer_user_data_set(&mod_status_timer, widget);
-    k_timer_start(&mod_status_timer, K_MSEC(100), K_MSEC(100));
+    lv_timer_create(mod_status_lv_timer_cb, 100, widget);
 
     return 0;
 }
