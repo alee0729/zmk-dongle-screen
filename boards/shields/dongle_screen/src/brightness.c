@@ -295,8 +295,7 @@ void fade_thread(void)
             // would fire anyway, leaving the display sleeping while screen_on
             // is true — a blank/frozen display with no recovery path short of
             // a power cycle.
-            // if (req.suspend_after_fade && req.to == 0 && !screen_on)
-            if (req.suspend_after_fade && req.to == 0)
+            if (req.suspend_after_fade && req.to == 0 && !screen_on)
             {
                 pm_device_action_run(display_dev, PM_DEVICE_ACTION_SUSPEND);
             }
