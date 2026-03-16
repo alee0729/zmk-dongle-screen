@@ -412,6 +412,11 @@ static int st7789v_pm_action(const struct device *dev, enum pm_device_action act
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
+		/* After SYSTEM_OFF the display loses all register state, so a full
+		 * re-initialization is required rather than just SLEEP_OUT. */
+		st7789v_reset_display(dev);
+		st7789v_blanking_on(dev);
+		st7789v_lcd_init(dev);
 		st7789v_exit_sleep(dev);
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
