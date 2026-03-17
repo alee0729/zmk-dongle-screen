@@ -412,13 +412,13 @@ static int st7789v_pm_action(const struct device *dev, enum pm_device_action act
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
-		/* Runtime PM only: send SLEEP_OUT to wake the controller.
-		 * Display RAM and all register configuration are preserved during
-		 * SLEEP_IN, so SLEEP_OUT is sufficient and avoids trashing the
-		 * frame buffer with a hardware reset.
-		 * After SYSTEM_OFF the system performs a cold boot and st7789v_init
-		 * handles full re-initialization; this path is never reached then. */
+		/* Wake the controller from sleep and re-enable display output.
+		 * Display RAM and registers are preserved during SLEEP_IN so no
+		 * re-init is required.  However, ZMK's display manager may call
+		 * display_blanking_on (DISP_OFF) before we send SLEEP_IN, so
+		 * blanking_off (DISP_ON) must be sent explicitly on resume. */
 		st7789v_exit_sleep(dev);
+		st7789v_blanking_off(dev);
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
 		st7789v_transmit(dev, ST7789V_CMD_SLEEP_IN, NULL, 0);
