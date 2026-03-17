@@ -263,17 +263,17 @@ config DONGLE_SCREEN_LAYER_OTHER_COLOR
 # Battery color thresholds
 config DONGLE_SCREEN_BATTERY_GREEN_THRESHOLD
     int "Battery level threshold for green color (level >= this value)"
-    default 85
+    default 75
     range 1 100
 
 config DONGLE_SCREEN_BATTERY_YELLOW_THRESHOLD
     int "Battery level threshold for yellow color (level >= this value)"
-    default 70
+    default 50
     range 1 100
 
 config DONGLE_SCREEN_BATTERY_ORANGE_THRESHOLD
     int "Battery level threshold for orange color (level >= this value)"
-    default 40
+    default 25
     range 1 100
 
 endif
