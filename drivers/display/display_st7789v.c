@@ -412,16 +412,13 @@ static int st7789v_pm_action(const struct device *dev, enum pm_device_action act
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
-		/* After SYSTEM_OFF the display loses all register state, so a full
-		 * re-initialization is required rather than just SLEEP_OUT.
-		 * blanking_on (DISP_OFF) is sent before init to suppress garbage
-		 * during register programming; blanking_off (DISP_ON) re-enables
-		 * output at the end since LVGL does not re-issue it on wake. */
-		st7789v_reset_display(dev);
-		st7789v_blanking_on(dev);
-		st7789v_lcd_init(dev);
+		/* Runtime PM only: send SLEEP_OUT to wake the controller.
+		 * Display RAM and all register configuration are preserved during
+		 * SLEEP_IN, so SLEEP_OUT is sufficient and avoids trashing the
+		 * frame buffer with a hardware reset.
+		 * After SYSTEM_OFF the system performs a cold boot and st7789v_init
+		 * handles full re-initialization; this path is never reached then. */
 		st7789v_exit_sleep(dev);
-		st7789v_blanking_off(dev);
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
 		st7789v_transmit(dev, ST7789V_CMD_SLEEP_IN, NULL, 0);
