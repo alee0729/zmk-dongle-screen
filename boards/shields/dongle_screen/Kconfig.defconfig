@@ -251,6 +251,14 @@ config DONGLE_SCREEN_BLE_COLOR
     hex "BLE label color (RGB hex, default 0x0000ff = blue)"
     default 0x0000ff
 
+config DONGLE_SCREEN_BLE_COLOR_PAIRING
+    hex "BLE label color when in pairing/discoverable mode (RGB hex, default 0xffff00 = yellow)"
+    default 0xffff00
+
+config DONGLE_SCREEN_BLE_COLOR_DISCONNECTED
+    hex "BLE label color when bonded but not connected (RGB hex, default 0xff0000 = red)"
+    default 0xff0000
+
 # Layer colors
 config DONGLE_SCREEN_LAYER_BASE_COLOR
     hex "Layer label color for the base layer (index 0) (RGB hex, default 0xffffff = white)"

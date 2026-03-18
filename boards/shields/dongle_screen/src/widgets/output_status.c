@@ -54,7 +54,15 @@ static void set_status_symbol(struct zmk_widget_output_status *widget, struct ou
             ? CONFIG_DONGLE_SCREEN_USB_COLOR_CONNECTED
             : CONFIG_DONGLE_SCREEN_USB_COLOR_DISCONNECTED);
 
-    snprintf(ble_color, sizeof(ble_color), "%06x", CONFIG_DONGLE_SCREEN_BLE_COLOR);
+    uint32_t ble_color_val;
+    if (!state.active_profile_bonded) {
+        ble_color_val = CONFIG_DONGLE_SCREEN_BLE_COLOR_PAIRING;
+    } else if (state.active_profile_connected) {
+        ble_color_val = CONFIG_DONGLE_SCREEN_BLE_COLOR;
+    } else {
+        ble_color_val = CONFIG_DONGLE_SCREEN_BLE_COLOR_DISCONNECTED;
+    }
+    snprintf(ble_color, sizeof(ble_color), "%06x", ble_color_val);
 
     switch (state.selected_endpoint.transport)
     {
@@ -70,10 +78,10 @@ static void set_status_symbol(struct zmk_widget_output_status *widget, struct ou
     lv_obj_set_style_text_align(widget->transport_label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_text(widget->transport_label, transport_text);
 
-    char ble_text[12];
+    char ble_text[30];
 
-    snprintf(ble_text, sizeof(ble_text), "%d", state.active_profile_index + 1);
-    // lv_obj_set_style_text_align(widget->ble_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_recolor(widget->ble_label, true);
+    snprintf(ble_text, sizeof(ble_text), "#%s %d#", ble_color, state.active_profile_index + 1);
     lv_label_set_text(widget->ble_label, ble_text);
 }
 
