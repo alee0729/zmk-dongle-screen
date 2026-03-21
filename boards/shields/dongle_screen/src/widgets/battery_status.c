@@ -11,7 +11,14 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/battery.h>
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 #include <zmk/split/central.h>
+#define BATTERY_DISPLAY_COUNT ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT
+#elif IS_ENABLED(CONFIG_DONGLE_SCREEN_BATTERY_RELAY)
+#define BATTERY_DISPLAY_COUNT CONFIG_DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT
+#else
+#define BATTERY_DISPLAY_COUNT 1
+#endif
 #include <zmk/display.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/usb_conn_state_changed.h>
@@ -38,22 +45,22 @@ struct battery_state {
 struct battery_object {
     lv_obj_t *symbol;
     lv_obj_t *label;
-} battery_objects[ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET];
+} battery_objects[BATTERY_DISPLAY_COUNT + SOURCE_OFFSET];
     
-static lv_color_t battery_image_buffer[ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET][102 * 5];
+static lv_color_t battery_image_buffer[BATTERY_DISPLAY_COUNT + SOURCE_OFFSET][102 * 5];
 
 // Peripheral reconnection tracking
 // ZMK sends battery events with level < 1 when peripherals disconnect
-static int8_t last_battery_levels[ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET];
+static int8_t last_battery_levels[BATTERY_DISPLAY_COUNT + SOURCE_OFFSET];
 
 static void init_peripheral_tracking(void) {
-    for (int i = 0; i < (ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET); i++) {
+    for (int i = 0; i < (BATTERY_DISPLAY_COUNT + SOURCE_OFFSET); i++) {
         last_battery_levels[i] = -1; // -1 indicates never seen before
     }
 }
 
 static bool is_peripheral_reconnecting(uint8_t source, uint8_t new_level) {
-    if (source >= (ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET)) {
+    if (source >= (BATTERY_DISPLAY_COUNT + SOURCE_OFFSET)) {
         return false;
     }
     
@@ -107,7 +114,7 @@ static void draw_battery(lv_obj_t *canvas, uint8_t level, bool usb_present) {
 }
 
 static void set_battery_symbol(lv_obj_t *widget, struct battery_state state) {
-    if (state.source >= ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET) {
+    if (state.source >= BATTERY_DISPLAY_COUNT + SOURCE_OFFSET) {
         return;
     }
     
@@ -206,7 +213,7 @@ int zmk_widget_dongle_battery_status_init(struct zmk_widget_dongle_battery_statu
 
     lv_obj_set_size(widget->obj, 240, 40);
     
-    for (int i = 0; i < ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT + SOURCE_OFFSET; i++) {
+    for (int i = 0; i < BATTERY_DISPLAY_COUNT + SOURCE_OFFSET; i++) {
         lv_obj_t *image_canvas = lv_canvas_create(widget->obj);
         lv_obj_t *battery_label = lv_label_create(widget->obj);
 
