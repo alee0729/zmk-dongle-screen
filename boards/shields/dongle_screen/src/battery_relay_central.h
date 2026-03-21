@@ -15,14 +15,14 @@
  * battery level updates so the peripheral's display can show all splits'
  * battery levels.
  *
- * Service UUID : 7b1a2e3c-4d5f-6a7b-8c9d-aebfc0d1e2f3
- * Characteristic: 7b1a2e3c-4d5f-6a7b-8c9d-aebfc0d1e2f4
+ * Service UUID : 6e400010-b5a3-f393-e0a9-e50e24dcca9e
+ * Characteristic: 6e400011-b5a3-f393-e0a9-e50e24dcca9e
  */
 #define BATTERY_RELAY_SERVICE_UUID_INIT \
-    BT_UUID_128_ENCODE(0x7b1a2e3c, 0x4d5f, 0x6a7b, 0x8c9d, 0xaebfc0d1e2f3)
+    BT_UUID_128_ENCODE(0x6e400010, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e)
 
 #define BATTERY_RELAY_CHAR_UUID_INIT \
-    BT_UUID_128_ENCODE(0x7b1a2e3c, 0x4d5f, 0x6a7b, 0x8c9d, 0xaebfc0d1e2f4)
+    BT_UUID_128_ENCODE(0x6e400011, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e)
 
 #define BATTERY_RELAY_SERVICE_UUID BT_UUID_DECLARE_128(BATTERY_RELAY_SERVICE_UUID_INIT)
 #define BATTERY_RELAY_CHAR_UUID    BT_UUID_DECLARE_128(BATTERY_RELAY_CHAR_UUID_INIT)
