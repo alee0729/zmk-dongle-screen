@@ -82,10 +82,19 @@ struct peripheral_relay {
 #define RELAY_PERIODIC_BROADCAST_MS 60000
 
 /* Retry parameters for GATT discovery when it fails (e.g. -EBUSY). */
-#define MAX_DISCOVERY_RETRIES 10
-#define DISCOVERY_RETRY_BASE_MS 500
+#define MAX_DISCOVERY_RETRIES 5
+#define DISCOVERY_RETRY_BASE_MS 1000
+
+/* Minimum interval between layer broadcasts (ms).  Momentary layer taps
+ * generate rapid activate/deactivate pairs; debouncing avoids flooding
+ * the BLE TX buffers which can starve ZMK's split communication. */
+#define LAYER_BROADCAST_DEBOUNCE_MS 100
 
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+
+/* Debounced layer broadcast work */
+static void layer_broadcast_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(layer_broadcast_work, layer_broadcast_work_handler);
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -180,6 +189,11 @@ static void schedule_push_cached_state(struct peripheral_relay *relay) {
     k_work_schedule(&relay->push_work, K_MSEC(200));
 }
 
+/* Debounced layer broadcast: writes the latest cached layer to all relays. */
+static void layer_broadcast_work_handler(struct k_work *work) {
+    broadcast_layer(layer_cache);
+}
+
 /* -------------------------------------------------------------------------
  * GATT discovery — battery first, then layer (chained)
  * ---------------------------------------------------------------------- */
@@ -190,13 +204,17 @@ static void start_layer_discovery(struct peripheral_relay *relay);
 static void schedule_discovery_retry(struct peripheral_relay *relay, const char *phase) {
     if (relay->discovery_retries < MAX_DISCOVERY_RETRIES) {
         uint32_t delay = DISCOVERY_RETRY_BASE_MS *
-                         (1U << MIN(relay->discovery_retries, 4));
+                         (1U << MIN(relay->discovery_retries, 3));
         relay->discovery_retries++;
         LOG_INF("%s: retry %u/%d in %u ms", phase,
                 relay->discovery_retries, MAX_DISCOVERY_RETRIES, delay);
         k_work_schedule(&relay->discovery_work, K_MSEC(delay));
     } else {
-        LOG_ERR("%s: giving up after %d retries", phase, MAX_DISCOVERY_RETRIES);
+        LOG_ERR("%s: giving up after %d retries, pushing available state",
+                phase, MAX_DISCOVERY_RETRIES);
+        /* Push whatever state we have so battery info still works
+         * even if layer discovery never succeeded. */
+        schedule_push_cached_state(relay);
     }
 }
 
@@ -225,6 +243,10 @@ static uint8_t layer_discover_func(struct bt_conn *conn, const struct bt_gatt_at
 }
 
 static void start_layer_discovery(struct peripheral_relay *relay) {
+    if (relay->conn == NULL) {
+        return;
+    }
+
     memcpy(&relay->discover_uuid, LAYER_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
 
     relay->discover_params.uuid = &relay->discover_uuid.uuid;
@@ -248,8 +270,11 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
         if (!relay->bat_ready) {
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
         }
-        /* Chain: now discover layer relay characteristic */
-        start_layer_discovery(relay);
+        /* Chain: now discover layer relay characteristic.
+         * Guard against disconnect race — conn may have been cleared. */
+        if (relay->conn != NULL) {
+            start_layer_discovery(relay);
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -266,6 +291,10 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
 }
 
 static void start_battery_discovery(struct peripheral_relay *relay) {
+    if (relay->conn == NULL) {
+        return;
+    }
+
     memcpy(&relay->discover_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
 
     relay->discover_params.uuid = &relay->discover_uuid.uuid;
@@ -395,7 +424,9 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     if (layer_ev) {
         uint8_t highest = zmk_keymap_highest_layer_active();
         layer_cache = highest;
-        broadcast_layer(highest);
+        /* Debounce: schedule broadcast after a short delay so rapid
+         * layer activate/deactivate pairs only produce one BLE write. */
+        k_work_schedule(&layer_broadcast_work, K_MSEC(LAYER_BROADCAST_DEBOUNCE_MS));
         return ZMK_EV_EVENT_BUBBLE;
     }
 
