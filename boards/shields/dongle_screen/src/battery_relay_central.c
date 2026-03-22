@@ -90,7 +90,7 @@ struct peripheral_relay {
  * 2. Attempts discovery on ONE undiscovered peripheral (if any).
  * 3. Writes cached battery + layer state to all discovered peripherals.
  * Layer changes are also sent promptly via debounced event-driven writes. */
-#define RELAY_PERIODIC_MS 60000
+#define RELAY_PERIODIC_MS 30000
 
 /* Delay between individual GATT writes during periodic broadcast.
  * Spaces out writes to avoid exhausting BLE TX buffers in a burst. */
@@ -249,16 +249,17 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
                                       struct bt_gatt_discover_params *params) {
     struct peripheral_relay *relay = CONTAINER_OF(params, struct peripheral_relay, discover_params);
     relay->discovery_in_flight = false;
-    relay->bat_discovery_done = true;
 
     if (!attr) {
-        LOG_DBG("relay: characteristic not found on conn %p", (void *)conn);
+        LOG_WRN("relay: characteristic not found on conn %p, will retry", (void *)conn);
+        /* Do NOT set bat_discovery_done — allow retry next cycle */
         return BT_GATT_ITER_STOP;
     }
 
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready = true;
+    relay->bat_discovery_done = true;
     LOG_INF("relay: characteristic found, handle=%u", relay->bat_char_handle);
 
     return BT_GATT_ITER_STOP;
@@ -397,9 +398,9 @@ static int relay_central_init(void) {
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */
                        NULL);
 
-    /* First periodic cycle at 60 s — gives ZMK's split stack plenty of
-     * time to fully establish connections, security, and subscriptions
-     * on all peripherals before we attempt any GATT operations. */
+    /* First periodic cycle at 30 s — gives ZMK's split stack time to
+     * establish connections before we attempt GATT discovery.  If discovery
+     * fails (peripheral not ready), it retries each subsequent cycle. */
     k_work_schedule_for_queue(&relay_work_q, &periodic_work,
                               K_MSEC(RELAY_PERIODIC_MS));
     return 0;
