@@ -347,17 +347,13 @@ static void periodic_handler(struct k_work *work) {
         struct peripheral_relay *relay = &relays[r];
 
         for (int src = 0; src < ARRAY_SIZE(battery_cache); src++) {
-            if (battery_cache[src] > 0) {
-                write_to_relay(relay, (uint8_t)src, battery_cache[src]);
-                k_msleep(RELAY_WRITE_SPACING_MS);
-            }
+            write_to_relay(relay, (uint8_t)src, battery_cache[src]);
+            k_msleep(RELAY_WRITE_SPACING_MS);
         }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
-        if (dongle_battery_cache > 0) {
-            write_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
-            k_msleep(RELAY_WRITE_SPACING_MS);
-        }
+        write_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+        k_msleep(RELAY_WRITE_SPACING_MS);
 #endif
 
         write_to_relay(relay, BATTERY_RELAY_SOURCE_LAYER, layer_cache);
