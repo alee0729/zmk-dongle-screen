@@ -20,12 +20,26 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
 
-#include <zmk/events/peripheral_battery_state_changed.h>
 #include <zmk/event_manager.h>
 
 #include "battery_relay_central.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+
+/*
+ * On peripheral builds zmk/split/central.h is not available, so the
+ * zmk_peripheral_battery_state_changed event struct is not declared.
+ * Provide a local declaration + implementation so we can raise it here
+ * and have the battery_status widget (which subscribes unconditionally)
+ * pick it up.
+ */
+struct zmk_peripheral_battery_state_changed {
+    uint8_t source;
+    uint8_t state_of_charge;
+};
+
+ZMK_EVENT_DECLARE(zmk_peripheral_battery_state_changed);
+ZMK_EVENT_IMPL(zmk_peripheral_battery_state_changed);
 
 /* -------------------------------------------------------------------------
  * Relay cache
