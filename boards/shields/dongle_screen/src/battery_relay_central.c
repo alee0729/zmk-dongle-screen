@@ -42,7 +42,7 @@ struct peripheral_relay {
     struct bt_uuid_128 char_uuid; /* copy kept alive for async discovery */
 };
 
-static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
