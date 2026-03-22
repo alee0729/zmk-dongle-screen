@@ -214,6 +214,7 @@ static void write_to_relay(struct peripheral_relay *relay, uint8_t source, uint8
     if (!relay->bat_ready || relay->conn == NULL) {
         return;
     }
+    LOG_INF("relay: writing source=%u level=%u to handle=%u", source, level, relay->bat_char_handle);
     struct battery_relay_data data = { .source = source, .level = level };
     int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
                                              &data, sizeof(data), false);
@@ -302,12 +303,25 @@ static void periodic_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(periodic_work, periodic_handler);
 
 static void periodic_handler(struct k_work *work) {
+    LOG_INF("relay: periodic handler running");
+
     /* Step 1: Sync relay array with current BLE connections */
     sync_relay_connections();
+
+    /* Log relay state for diagnostics */
+    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+        if (relays[i].conn != NULL) {
+            LOG_INF("relay: slot %d: conn=%p ready=%d disc_done=%d in_flight=%d handle=%u",
+                    i, (void *)relays[i].conn, relays[i].bat_ready,
+                    relays[i].bat_discovery_done, relays[i].discovery_in_flight,
+                    relays[i].bat_char_handle);
+        }
+    }
 
     /* Step 2: Try discovery on one undiscovered relay */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (try_discovery_step(&relays[i])) {
+            LOG_INF("relay: started discovery on slot %d", i);
             break; /* At most one discovery per cycle */
         }
     }
@@ -393,6 +407,7 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
  * ---------------------------------------------------------------------- */
 
 static int relay_central_init(void) {
+    LOG_INF("relay: central init, periodic_ms=%d", RELAY_PERIODIC_MS);
     k_work_queue_start(&relay_work_q, relay_work_q_stack,
                        K_THREAD_STACK_SIZEOF(relay_work_q_stack),
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */

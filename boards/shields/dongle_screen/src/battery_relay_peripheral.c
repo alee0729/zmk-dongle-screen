@@ -72,6 +72,7 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
     }
 
     const struct battery_relay_data *data = buf;
+    LOG_INF("relay_periph: write received source=%u level=%u", data->source, data->level);
 
     /* Ignore the dongle's own battery (no slot for it on peripheral display) */
     if (data->source == BATTERY_RELAY_SOURCE_DONGLE) {
