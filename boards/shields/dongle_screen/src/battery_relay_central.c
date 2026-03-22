@@ -7,7 +7,7 @@
  * ======================================
  * When enabled, the central:
  *   1. Subscribes to ZMK battery and layer events, caching values locally.
- *   2. Periodically (every 60 s) scans for connected peripherals using
+ *   2. Periodically scans for connected peripherals using
  *      bt_conn_foreach, attempts GATT discovery on any whose relay handle
  *      is not yet known, then writes cached state to all discovered ones.
  *
@@ -85,12 +85,15 @@ struct peripheral_relay {
     bool discovery_in_flight;
 };
 
-/* How often to run the periodic handler (ms).  Each cycle:
- * 1. Scans for new peripheral connections via bt_conn_foreach.
- * 2. Attempts discovery on ONE undiscovered peripheral (if any).
- * 3. Writes cached battery + layer state to all discovered peripherals.
- * Layer changes are also sent promptly via debounced event-driven writes. */
-#define RELAY_PERIODIC_MS 30000
+/* Periodic handler intervals (ms).
+ * Fast interval is used while any relay still needs discovery.
+ * Slow interval is used once all relays are ready (battery refresh). */
+#define RELAY_FAST_MS  5000
+#define RELAY_SLOW_MS 30000
+
+/* Initial delay before the first periodic cycle (ms).
+ * Must be long enough for ZMK's split stack to establish connections. */
+#define RELAY_INITIAL_DELAY_MS 15000
 
 /* Delay between individual GATT writes during periodic broadcast.
  * Spaces out writes to avoid exhausting BLE TX buffers in a burst. */
@@ -292,9 +295,11 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
 /* -------------------------------------------------------------------------
  * Periodic handler — connection scan + discovery + broadcast.
  *
- * Runs on relay_work_q every RELAY_PERIODIC_MS.  Each cycle:
+ * Runs on relay_work_q.  While any relay needs discovery, runs every 5 s.
+ * Once all relays are discovered, slows to 30 s (battery refresh only).
+ * Each cycle:
  * 1. Scans for new/disconnected peripherals via bt_conn_foreach.
- * 2. Tries ONE discovery on the first relay that needs it.
+ * 2. Tries discovery on ALL undiscovered peripherals.
  * 3. Writes cached battery + layer state to all discovered relays with
  *    spacing between writes to avoid TX buffer exhaustion.
  * ---------------------------------------------------------------------- */
@@ -303,26 +308,28 @@ static void periodic_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(periodic_work, periodic_handler);
 
 static void periodic_handler(struct k_work *work) {
-    LOG_INF("relay: periodic handler running");
-
     /* Step 1: Sync relay array with current BLE connections */
     sync_relay_connections();
+
+    /* Step 2: Try discovery on ALL undiscovered relays.
+     * Each relay has its own discover_params and they're on separate
+     * connections, so concurrent discoveries are safe. */
+    bool all_ready = true;
+    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+        if (relays[i].conn != NULL && !relays[i].bat_ready) {
+            all_ready = false;
+            if (try_discovery_step(&relays[i])) {
+                LOG_INF("relay: started discovery on slot %d", i);
+            }
+        }
+    }
 
     /* Log relay state for diagnostics */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (relays[i].conn != NULL) {
-            LOG_INF("relay: slot %d: conn=%p ready=%d disc_done=%d in_flight=%d handle=%u",
-                    i, (void *)relays[i].conn, relays[i].bat_ready,
-                    relays[i].bat_discovery_done, relays[i].discovery_in_flight,
+            LOG_INF("relay: slot %d: ready=%d disc_done=%d handle=%u",
+                    i, relays[i].bat_ready, relays[i].bat_discovery_done,
                     relays[i].bat_char_handle);
-        }
-    }
-
-    /* Step 2: Try discovery on one undiscovered relay */
-    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        if (try_discovery_step(&relays[i])) {
-            LOG_INF("relay: started discovery on slot %d", i);
-            break; /* At most one discovery per cycle */
         }
     }
 
@@ -348,15 +355,15 @@ static void periodic_handler(struct k_work *work) {
         k_msleep(RELAY_WRITE_SPACING_MS);
     }
 
-    /* Reschedule */
-    k_work_schedule_for_queue(&relay_work_q, &periodic_work,
-                              K_MSEC(RELAY_PERIODIC_MS));
+    /* Reschedule: fast while discovering, slow once all relays are ready */
+    int next_ms = all_ready ? RELAY_SLOW_MS : RELAY_FAST_MS;
+    k_work_schedule_for_queue(&relay_work_q, &periodic_work, K_MSEC(next_ms));
 }
 
 /* -------------------------------------------------------------------------
  * ZMK event listener
  *
- * Battery: cache only — periodic broadcast handles delivery (60 s).
+ * Battery: cache only — periodic broadcast handles delivery (30 s).
  * Layer:   cache + debounced write — layer changes are user-visible and
  *          tied to keypresses, so they need prompt delivery.  The write
  *          is deferred to relay_work_q so ZMK's event pipeline never
@@ -413,11 +420,12 @@ static int relay_central_init(void) {
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */
                        NULL);
 
-    /* First periodic cycle at 30 s — gives ZMK's split stack time to
+    /* First periodic cycle at 15 s — gives ZMK's split stack time to
      * establish connections before we attempt GATT discovery.  If discovery
-     * fails (peripheral not ready), it retries each subsequent cycle. */
+     * fails (peripheral not ready), it retries every 5 s until all relays
+     * are discovered, then switches to 30 s for periodic battery refresh. */
     k_work_schedule_for_queue(&relay_work_q, &periodic_work,
-                              K_MSEC(RELAY_PERIODIC_MS));
+                              K_MSEC(RELAY_INITIAL_DELAY_MS));
     return 0;
 }
 
