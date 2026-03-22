@@ -9,7 +9,7 @@
  *   1. Registers BT connection callbacks to track peripheral connections.
  *   2. Subscribes to ZMK battery and layer events, caching values locally.
  *   3. Periodically (every 60 s) attempts GATT discovery on any connected
- *      peripheral whose relay handles are not yet known, then writes
+ *      peripheral whose relay handle is not yet known, then writes
  *      cached state to all discovered peripherals.
  *
  * DESIGN PRINCIPLE: Never initiate GATT operations at connection time.
@@ -22,8 +22,10 @@
  * on a dedicated low-priority work queue.  If discovery fails (-EBUSY
  * because ZMK is doing a battery read), we simply try again next cycle.
  *
- * This allows peripherals with displays (e.g. nice_view_gem) to show battery
- * levels for all keyboard splits and the current active layer.
+ * Both battery and layer data are multiplexed through the single battery
+ * relay GATT characteristic.  Layer data uses source=BATTERY_RELAY_SOURCE_LAYER
+ * with the layer index in the level field.  This avoids needing a separate
+ * layer characteristic and eliminates a second GATT discovery operation.
  */
 
 #include <zephyr/kernel.h>
@@ -73,14 +75,10 @@ static uint8_t dongle_battery_cache;
 struct peripheral_relay {
     struct bt_conn *conn;
 
-    /* Battery relay GATT characteristic */
+    /* Battery relay GATT characteristic — also used for layer data */
     uint16_t bat_char_handle;
     bool bat_ready;          /* characteristic found and usable for writes */
-    bool bat_discovery_done; /* battery discovery has been attempted */
-
-    /* Layer relay GATT characteristic */
-    uint16_t layer_char_handle;
-    bool layer_ready;
+    bool bat_discovery_done; /* discovery has been attempted (won't retry) */
 
     /* Discovery state — used by the periodic handler, one relay at a time */
     struct bt_gatt_discover_params discover_params;
@@ -131,9 +129,13 @@ static struct peripheral_relay *get_free_relay(void) {
 
 /* -------------------------------------------------------------------------
  * Write helpers — only called from relay_work_q context
+ *
+ * All data (battery AND layer) goes through the single battery relay
+ * characteristic.  Layer data is encoded as source=BATTERY_RELAY_SOURCE_LAYER,
+ * level=layer_index.
  * ---------------------------------------------------------------------- */
 
-static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
+static void write_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
     if (!relay->bat_ready || relay->conn == NULL) {
         return;
     }
@@ -141,26 +143,9 @@ static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t sourc
     int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
                                              &data, sizeof(data), false);
     if (err) {
-        LOG_WRN("battery_relay: write failed: %d", err);
+        LOG_WRN("relay: write failed (source=%u): %d", source, err);
         if (err == -ENOTCONN) {
             relay->bat_ready = false;
-            relay->layer_ready = false;
-        }
-    }
-}
-
-static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) {
-    if (!relay->layer_ready || relay->conn == NULL) {
-        return;
-    }
-    struct layer_relay_data data = { .layer = layer };
-    int err = bt_gatt_write_without_response(relay->conn, relay->layer_char_handle,
-                                             &data, sizeof(data), false);
-    if (err) {
-        LOG_WRN("layer_relay: write failed: %d", err);
-        if (err == -ENOTCONN) {
-            relay->bat_ready = false;
-            relay->layer_ready = false;
         }
     }
 }
@@ -169,108 +154,69 @@ static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) 
  * Runs on relay_work_q — safe to block on TX credits without affecting ZMK. */
 static void layer_broadcast_work_handler(struct k_work *work) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        write_layer_to_relay(&relays[i], layer_cache);
+        write_to_relay(&relays[i], BATTERY_RELAY_SOURCE_LAYER, layer_cache);
     }
 }
 
 /* -------------------------------------------------------------------------
  * GATT discovery — called from periodic handler, one relay at a time.
  *
+ * Only ONE discovery is needed per peripheral: the battery relay
+ * characteristic.  Layer data is multiplexed through the same characteristic,
+ * so no separate layer discovery is required.
+ *
  * Discovery callbacks run in BT RX thread context.  They just record the
  * result and clear the in_flight flag — no further GATT calls are made
- * from within callbacks.  The next periodic cycle handles chaining.
+ * from within callbacks.
  * ---------------------------------------------------------------------- */
-
-static uint8_t layer_discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                    struct bt_gatt_discover_params *params) {
-    struct peripheral_relay *relay = CONTAINER_OF(params, struct peripheral_relay, discover_params);
-    relay->discovery_in_flight = false;
-
-    if (!attr) {
-        LOG_DBG("layer_relay: characteristic not found on conn %p", (void *)conn);
-        return BT_GATT_ITER_STOP;
-    }
-
-    struct bt_gatt_chrc *chrc = attr->user_data;
-    relay->layer_char_handle = chrc->value_handle;
-    relay->layer_ready = true;
-    LOG_INF("layer_relay: characteristic found, handle=%u", relay->layer_char_handle);
-
-    return BT_GATT_ITER_STOP;
-}
 
 static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                       struct bt_gatt_discover_params *params) {
     struct peripheral_relay *relay = CONTAINER_OF(params, struct peripheral_relay, discover_params);
     relay->discovery_in_flight = false;
+    relay->bat_discovery_done = true;
 
     if (!attr) {
-        LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
-        relay->bat_discovery_done = true;
+        LOG_DBG("relay: characteristic not found on conn %p", (void *)conn);
         return BT_GATT_ITER_STOP;
     }
 
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready = true;
-    relay->bat_discovery_done = true;
-    LOG_INF("battery_relay: characteristic found, handle=%u", relay->bat_char_handle);
+    LOG_INF("relay: characteristic found, handle=%u", relay->bat_char_handle);
 
     return BT_GATT_ITER_STOP;
 }
 
-/** Try one step of discovery on a relay that needs it.
+/** Try discovery on a relay that needs it.
  *  Returns true if a discovery was started (caller should not start another). */
 static bool try_discovery_step(struct peripheral_relay *relay) {
-    if (relay->conn == NULL || relay->discovery_in_flight) {
+    if (relay->conn == NULL || relay->discovery_in_flight || relay->bat_discovery_done) {
         return false;
     }
 
-    if (!relay->bat_discovery_done) {
-        /* Try battery characteristic discovery */
-        memcpy(&relay->discover_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
-        relay->discover_params.uuid = &relay->discover_uuid.uuid;
-        relay->discover_params.func = battery_discover_func;
-        relay->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-        relay->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-        relay->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+    memcpy(&relay->discover_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
+    relay->discover_params.uuid = &relay->discover_uuid.uuid;
+    relay->discover_params.func = battery_discover_func;
+    relay->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+    relay->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+    relay->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
-        int err = bt_gatt_discover(relay->conn, &relay->discover_params);
-        if (err) {
-            LOG_DBG("battery_relay: discovery returned %d, will retry next cycle", err);
-            return false;
-        }
-        relay->discovery_in_flight = true;
-        return true;
+    int err = bt_gatt_discover(relay->conn, &relay->discover_params);
+    if (err) {
+        LOG_DBG("relay: discovery returned %d, will retry next cycle", err);
+        return false;
     }
-
-    if (relay->bat_ready && !relay->layer_ready) {
-        /* Battery found but layer not yet — try layer discovery.
-         * Skip if battery wasn't found (no relay services on this peripheral). */
-        memcpy(&relay->discover_uuid, LAYER_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
-        relay->discover_params.uuid = &relay->discover_uuid.uuid;
-        relay->discover_params.func = layer_discover_func;
-        relay->discover_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-        relay->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-        relay->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-        int err = bt_gatt_discover(relay->conn, &relay->discover_params);
-        if (err) {
-            LOG_DBG("layer_relay: discovery returned %d, will retry next cycle", err);
-            return false;
-        }
-        relay->discovery_in_flight = true;
-        return true;
-    }
-
-    return false;
+    relay->discovery_in_flight = true;
+    return true;
 }
 
 /* -------------------------------------------------------------------------
  * Periodic handler — discovery + broadcast, all in one place.
  *
  * Runs on relay_work_q every RELAY_PERIODIC_MS.  Each cycle:
- * 1. Tries ONE discovery step on the first relay that needs it (at most
+ * 1. Tries ONE discovery on the first relay that needs it (at most
  *    one bt_gatt_discover per cycle to minimize ATT channel disruption).
  * 2. Writes cached battery + layer state to all discovered relays with
  *    spacing between writes to avoid TX buffer exhaustion.
@@ -293,20 +239,19 @@ static void periodic_handler(struct k_work *work) {
 
         for (int src = 0; src < ARRAY_SIZE(battery_cache); src++) {
             if (battery_cache[src] > 0) {
-                write_battery_to_relay(relay, (uint8_t)src, battery_cache[src]);
+                write_to_relay(relay, (uint8_t)src, battery_cache[src]);
                 k_msleep(RELAY_WRITE_SPACING_MS);
             }
         }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
         if (dongle_battery_cache > 0) {
-            write_battery_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE,
-                                   dongle_battery_cache);
+            write_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
             k_msleep(RELAY_WRITE_SPACING_MS);
         }
 #endif
 
-        write_layer_to_relay(relay, layer_cache);
+        write_to_relay(relay, BATTERY_RELAY_SOURCE_LAYER, layer_cache);
         k_msleep(RELAY_WRITE_SPACING_MS);
     }
 
@@ -335,7 +280,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
 
     struct peripheral_relay *relay = get_free_relay();
     if (!relay) {
-        LOG_WRN("battery_relay: no free relay slot for new connection");
+        LOG_WRN("relay: no free relay slot for new connection");
         return;
     }
 
@@ -343,11 +288,9 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->bat_ready = false;
     relay->bat_discovery_done = false;
     relay->bat_char_handle = 0;
-    relay->layer_ready = false;
-    relay->layer_char_handle = 0;
     relay->discovery_in_flight = false;
 
-    LOG_INF("battery_relay: peripheral connected, will discover in next periodic cycle");
+    LOG_INF("relay: peripheral connected, will discover in next periodic cycle");
     /* NO discovery scheduled here — the periodic handler will pick it up */
 }
 
@@ -363,8 +306,6 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
     relay->bat_ready = false;
     relay->bat_discovery_done = false;
     relay->bat_char_handle = 0;
-    relay->layer_ready = false;
-    relay->layer_char_handle = 0;
     relay->discovery_in_flight = false;
 }
 

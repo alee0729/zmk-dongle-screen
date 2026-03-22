@@ -27,40 +27,25 @@
 #define BATTERY_RELAY_SERVICE_UUID BT_UUID_DECLARE_128(BATTERY_RELAY_SERVICE_UUID_INIT)
 #define BATTERY_RELAY_CHAR_UUID    BT_UUID_DECLARE_128(BATTERY_RELAY_CHAR_UUID_INIT)
 
-/*
- * 128-bit UUIDs for the layer relay GATT service.
- *
- * The central (dongle) discovers these on each peripheral and writes
- * the active layer index so the peripheral's display can show it.
- *
- * Service UUID : 6e400012-b5a3-f393-e0a9-e50e24dcca9e
- * Characteristic: 6e400013-b5a3-f393-e0a9-e50e24dcca9e
- */
-#define LAYER_RELAY_CHAR_UUID_INIT \
-    BT_UUID_128_ENCODE(0x6e400013, 0xb5a3, 0xf393, 0xe0a9, 0xe50e24dcca9e)
-
-#define LAYER_RELAY_CHAR_UUID BT_UUID_DECLARE_128(LAYER_RELAY_CHAR_UUID_INIT)
 
 /* source value used to identify the dongle's own battery */
 #define BATTERY_RELAY_SOURCE_DONGLE 0xFF
 
+/* source value used to carry layer data through the battery relay characteristic.
+ * When source == BATTERY_RELAY_SOURCE_LAYER, the level field contains the
+ * highest active layer index instead of a battery percentage. */
+#define BATTERY_RELAY_SOURCE_LAYER 0xFE
+
 /**
  * @brief Payload written by the central to each peripheral's relay characteristic.
  *
- * @param source  0-based peripheral index as seen by the central, or
- *                BATTERY_RELAY_SOURCE_DONGLE (0xFF) for the dongle itself.
- * @param level   Battery state-of-charge, 0-100 %.
+ * @param source  0-based peripheral index as seen by the central,
+ *                BATTERY_RELAY_SOURCE_DONGLE (0xFF) for the dongle itself,
+ *                or BATTERY_RELAY_SOURCE_LAYER (0xFE) for layer data.
+ * @param level   Battery state-of-charge (0-100 %) for battery sources,
+ *                or highest active layer index for BATTERY_RELAY_SOURCE_LAYER.
  */
 struct battery_relay_data {
     uint8_t source;
     uint8_t level;
-} __packed;
-
-/**
- * @brief Payload written by the central to each peripheral's layer relay characteristic.
- *
- * @param layer  Highest active layer index on the central.
- */
-struct layer_relay_data {
-    uint8_t layer;
 } __packed;
