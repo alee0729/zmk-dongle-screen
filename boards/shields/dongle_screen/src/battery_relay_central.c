@@ -6,26 +6,23 @@
  * Display Relay — Central (dongle) side
  * ======================================
  * When enabled, the central:
- *   1. Registers BT connection callbacks to track peripheral connections.
- *   2. Subscribes to ZMK battery and layer events, caching values locally.
- *   3. Periodically (every 60 s) attempts GATT discovery on any connected
- *      peripheral whose relay handle is not yet known, then writes
- *      cached state to all discovered peripherals.
+ *   1. Subscribes to ZMK battery and layer events, caching values locally.
+ *   2. Periodically (every 60 s) scans for connected peripherals using
+ *      bt_conn_foreach, attempts GATT discovery on any whose relay handle
+ *      is not yet known, then writes cached state to all discovered ones.
  *
- * DESIGN PRINCIPLE: Never initiate GATT operations at connection time.
+ * DESIGN PRINCIPLE: Zero code at connection time.
  * ZMK's split stack does extensive GATT work on connect (service discovery,
  * HID notification subscription, security, connection parameter negotiation).
- * Zephyr allows only one outstanding ATT request per connection — any GATT
- * client operation we start can collide with ZMK's and break key forwarding.
+ * Even registering a BT_CONN_CB connected callback that calls bt_conn_ref()
+ * can interfere with the second peripheral's connection setup.
  *
- * Instead, all discovery and writes happen lazily from the periodic handler
- * on a dedicated low-priority work queue.  If discovery fails (-EBUSY
- * because ZMK is doing a battery read), we simply try again next cycle.
+ * Instead, connections are discovered lazily via bt_conn_foreach in the
+ * periodic handler, which runs on a dedicated low-priority work queue.
  *
  * Both battery and layer data are multiplexed through the single battery
  * relay GATT characteristic.  Layer data uses source=BATTERY_RELAY_SOURCE_LAYER
- * with the layer index in the level field.  This avoids needing a separate
- * layer characteristic and eliminates a second GATT discovery operation.
+ * with the layer index in the level field.
  */
 
 #include <zephyr/kernel.h>
@@ -89,8 +86,9 @@ struct peripheral_relay {
 };
 
 /* How often to run the periodic handler (ms).  Each cycle:
- * 1. Attempts discovery on ONE undiscovered peripheral (if any).
- * 2. Writes cached battery + layer state to all discovered peripherals.
+ * 1. Scans for new peripheral connections via bt_conn_foreach.
+ * 2. Attempts discovery on ONE undiscovered peripheral (if any).
+ * 3. Writes cached battery + layer state to all discovered peripherals.
  * Layer changes are also sent promptly via debounced event-driven writes. */
 #define RELAY_PERIODIC_MS 60000
 
@@ -109,22 +107,99 @@ static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 static void layer_broadcast_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(layer_broadcast_work, layer_broadcast_work_handler);
 
-static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
-    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        if (relays[i].conn == conn) {
-            return &relays[i];
-        }
+/* -------------------------------------------------------------------------
+ * Connection scanning — find peripheral connections lazily.
+ *
+ * Instead of using BT_CONN_CB_DEFINE (which runs code at connection time
+ * and can interfere with ZMK's split stack setup), we scan for connections
+ * periodically using bt_conn_foreach.  This guarantees zero interference
+ * with connection establishment.
+ * ---------------------------------------------------------------------- */
+
+struct conn_scan_data {
+    struct bt_conn *active[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+    int count;
+};
+
+static void conn_scan_cb(struct bt_conn *conn, void *user_data) {
+    struct conn_scan_data *scan = user_data;
+    struct bt_conn_info info;
+
+    if (scan->count >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT) {
+        return;
     }
-    return NULL;
+
+    if (bt_conn_get_info(conn, &info) < 0) {
+        return;
+    }
+
+    /* Only interested in connections where we are the central */
+    if (info.role != BT_HCI_ROLE_CENTRAL) {
+        return;
+    }
+
+    scan->active[scan->count++] = conn;
 }
 
-static struct peripheral_relay *get_free_relay(void) {
+/** Synchronize relay array with currently active BLE connections.
+ *  - Adds new connections (with bt_conn_ref)
+ *  - Removes stale relay entries for disconnected peripherals
+ *  Called from periodic handler on relay_work_q. */
+static void sync_relay_connections(void) {
+    struct conn_scan_data scan = { .count = 0 };
+
+    bt_conn_foreach(BT_CONN_TYPE_LE, conn_scan_cb, &scan);
+
+    /* Remove relay entries for connections that are no longer active */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (relays[i].conn == NULL) {
-            return &relays[i];
+            continue;
+        }
+
+        bool still_active = false;
+        for (int s = 0; s < scan.count; s++) {
+            if (relays[i].conn == scan.active[s]) {
+                still_active = true;
+                break;
+            }
+        }
+
+        if (!still_active) {
+            LOG_DBG("relay: peripheral disconnected, clearing slot %d", i);
+            bt_conn_unref(relays[i].conn);
+            relays[i].conn = NULL;
+            relays[i].bat_ready = false;
+            relays[i].bat_discovery_done = false;
+            relays[i].bat_char_handle = 0;
+            relays[i].discovery_in_flight = false;
         }
     }
-    return NULL;
+
+    /* Add new connections that aren't in the relay array yet */
+    for (int s = 0; s < scan.count; s++) {
+        bool found = false;
+        for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+            if (relays[i].conn == scan.active[s]) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            /* Find a free slot */
+            for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+                if (relays[i].conn == NULL) {
+                    relays[i].conn = bt_conn_ref(scan.active[s]);
+                    relays[i].bat_ready = false;
+                    relays[i].bat_discovery_done = false;
+                    relays[i].bat_char_handle = 0;
+                    relays[i].discovery_in_flight = false;
+                    LOG_INF("relay: found peripheral connection, slot %d", i);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -213,12 +288,12 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
 }
 
 /* -------------------------------------------------------------------------
- * Periodic handler — discovery + broadcast, all in one place.
+ * Periodic handler — connection scan + discovery + broadcast.
  *
  * Runs on relay_work_q every RELAY_PERIODIC_MS.  Each cycle:
- * 1. Tries ONE discovery on the first relay that needs it (at most
- *    one bt_gatt_discover per cycle to minimize ATT channel disruption).
- * 2. Writes cached battery + layer state to all discovered relays with
+ * 1. Scans for new/disconnected peripherals via bt_conn_foreach.
+ * 2. Tries ONE discovery on the first relay that needs it.
+ * 3. Writes cached battery + layer state to all discovered relays with
  *    spacing between writes to avoid TX buffer exhaustion.
  * ---------------------------------------------------------------------- */
 
@@ -226,14 +301,17 @@ static void periodic_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(periodic_work, periodic_handler);
 
 static void periodic_handler(struct k_work *work) {
-    /* Step 1: Try discovery on one undiscovered relay */
+    /* Step 1: Sync relay array with current BLE connections */
+    sync_relay_connections();
+
+    /* Step 2: Try discovery on one undiscovered relay */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (try_discovery_step(&relays[i])) {
             break; /* At most one discovery per cycle */
         }
     }
 
-    /* Step 2: Write cached state to all discovered relays */
+    /* Step 3: Write cached state to all discovered relays */
     for (int r = 0; r < ARRAY_SIZE(relays); r++) {
         struct peripheral_relay *relay = &relays[r];
 
@@ -259,60 +337,6 @@ static void periodic_handler(struct k_work *work) {
     k_work_schedule_for_queue(&relay_work_q, &periodic_work,
                               K_MSEC(RELAY_PERIODIC_MS));
 }
-
-/* -------------------------------------------------------------------------
- * BT connection callbacks — just track connections, NO GATT operations.
- * ---------------------------------------------------------------------- */
-
-static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
-    if (conn_err) {
-        return;
-    }
-
-    /* Only handle connections where we are the central (split peripherals). */
-    struct bt_conn_info info;
-    if (bt_conn_get_info(conn, &info) < 0 || info.type != BT_CONN_TYPE_LE) {
-        return;
-    }
-    if (info.role != BT_HCI_ROLE_CENTRAL) {
-        return;
-    }
-
-    struct peripheral_relay *relay = get_free_relay();
-    if (!relay) {
-        LOG_WRN("relay: no free relay slot for new connection");
-        return;
-    }
-
-    relay->conn = bt_conn_ref(conn);
-    relay->bat_ready = false;
-    relay->bat_discovery_done = false;
-    relay->bat_char_handle = 0;
-    relay->discovery_in_flight = false;
-
-    LOG_INF("relay: peripheral connected, will discover in next periodic cycle");
-    /* NO discovery scheduled here — the periodic handler will pick it up */
-}
-
-static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
-    struct peripheral_relay *relay = get_relay_by_conn(conn);
-    if (!relay) {
-        return;
-    }
-
-    LOG_DBG("relay: peripheral disconnected (reason %u), clearing slot", reason);
-    bt_conn_unref(relay->conn);
-    relay->conn = NULL;
-    relay->bat_ready = false;
-    relay->bat_discovery_done = false;
-    relay->bat_char_handle = 0;
-    relay->discovery_in_flight = false;
-}
-
-BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
-    .connected = relay_connected,
-    .disconnected = relay_disconnected,
-};
 
 /* -------------------------------------------------------------------------
  * ZMK event listener
