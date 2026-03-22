@@ -97,10 +97,8 @@ struct peripheral_relay {
  * request per connection — our discovery blocks everything else). */
 #define RELAY_DISCOVERY_DELAY_MS 30000
 
-/* How often to write cached battery + layer state to peripherals (ms).
- * This is the ONLY path that generates GATT writes — event-driven
- * writes are intentionally avoided to minimize TX buffer contention
- * with ZMK's split HID communication. */
+/* How often to write cached battery state to peripherals (ms).
+ * Battery changes slowly — periodic broadcast is sufficient. */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
 
 /* Retry parameters for GATT discovery when it fails (e.g. -EBUSY). */
@@ -116,7 +114,16 @@ struct peripheral_relay {
  * Spaces out writes to avoid exhausting BLE TX buffers in a burst. */
 #define RELAY_WRITE_SPACING_MS 100
 
+/* Minimum interval between layer broadcasts (ms).  Momentary layer taps
+ * generate rapid activate/deactivate pairs; debouncing avoids flooding
+ * the BLE TX buffers which can starve ZMK's split communication. */
+#define LAYER_BROADCAST_DEBOUNCE_MS 100
+
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+
+/* Debounced layer broadcast — runs on relay_work_q */
+static void layer_broadcast_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(layer_broadcast_work, layer_broadcast_work_handler);
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -169,6 +176,14 @@ static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) 
             relay->bat_ready = false;
             relay->layer_ready = false;
         }
+    }
+}
+
+/* Debounced layer broadcast: writes the latest cached layer to all relays.
+ * Runs on relay_work_q — safe to block on TX credits without affecting ZMK. */
+static void layer_broadcast_work_handler(struct k_work *work) {
+    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+        write_layer_to_relay(&relays[i], layer_cache);
     }
 }
 
@@ -309,11 +324,12 @@ static void discovery_work_handler(struct k_work *work) {
 }
 
 /* -------------------------------------------------------------------------
- * Periodic broadcast — the ONLY path that writes to peripherals.
+ * Periodic broadcast — writes cached battery + layer state to peripherals.
  *
- * Writes all cached battery + layer state to every discovered peripheral,
- * with RELAY_WRITE_SPACING_MS between each write to avoid exhausting
- * BLE TX buffers that ZMK needs for HID reports / trackpoint data.
+ * Battery is only delivered here (every 60 s).  Layer is also sent here
+ * as a fallback, but primarily delivered by the debounced layer_broadcast_work.
+ * Writes are spaced by RELAY_WRITE_SPACING_MS to avoid exhausting BLE TX
+ * buffers that ZMK needs for HID reports / trackpoint data.
  * ---------------------------------------------------------------------- */
 
 static void periodic_broadcast_handler(struct k_work *work);
@@ -411,11 +427,14 @@ BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
 };
 
 /* -------------------------------------------------------------------------
- * ZMK event listener — cache battery + layer values only (no BLE writes).
+ * ZMK event listener
  *
- * Writing to peripherals is handled exclusively by the periodic broadcast.
- * This ensures ZMK's event pipeline never blocks on BLE TX and that the
- * shared TX buffers remain available for HID reports and trackpoint data.
+ * Battery: cache only — periodic broadcast handles delivery (60 s).
+ * Layer:   cache + debounced write — layer changes are user-visible and
+ *          tied to keypresses, so they need prompt delivery.  The write
+ *          is deferred to relay_work_q so ZMK's event pipeline never
+ *          blocks on BLE TX.  One small write per layer change is
+ *          acceptable TX buffer pressure.
  * ---------------------------------------------------------------------- */
 
 static int relay_central_event_handler(const zmk_event_t *eh) {
@@ -439,6 +458,9 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     const struct zmk_layer_state_changed *layer_ev = as_zmk_layer_state_changed(eh);
     if (layer_ev) {
         layer_cache = zmk_keymap_highest_layer_active();
+        /* Debounce: rapid layer activate/deactivate pairs produce one write */
+        k_work_schedule_for_queue(&relay_work_q, &layer_broadcast_work,
+                                  K_MSEC(LAYER_BROADCAST_DEBOUNCE_MS));
         return ZMK_EV_EVENT_BUBBLE;
     }
 
