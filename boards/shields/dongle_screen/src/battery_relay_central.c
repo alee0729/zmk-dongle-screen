@@ -314,15 +314,24 @@ static void periodic_handler(struct k_work *work) {
     /* Step 2: Try discovery on ALL undiscovered relays.
      * Each relay has its own discover_params and they're on separate
      * connections, so concurrent discoveries are safe. */
-    bool all_ready = true;
+    int connected = 0;
+    int ready = 0;
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        if (relays[i].conn != NULL && !relays[i].bat_ready) {
-            all_ready = false;
-            if (try_discovery_step(&relays[i])) {
-                LOG_INF("relay: started discovery on slot %d", i);
-            }
+        if (relays[i].conn == NULL) {
+            continue;
+        }
+        connected++;
+        if (relays[i].bat_ready) {
+            ready++;
+        } else if (try_discovery_step(&relays[i])) {
+            LOG_INF("relay: started discovery on slot %d", i);
         }
     }
+    /* Stay on fast timer until ALL expected peripherals are connected
+     * and discovered.  This ensures late-connecting peripherals are
+     * picked up quickly rather than waiting for the slow 30 s cycle. */
+    bool all_ready = (connected >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT) &&
+                     (ready == connected);
 
     /* Log relay state for diagnostics */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -414,7 +423,8 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
  * ---------------------------------------------------------------------- */
 
 static int relay_central_init(void) {
-    LOG_INF("relay: central init, periodic_ms=%d", RELAY_PERIODIC_MS);
+    LOG_INF("relay: central init, initial_delay=%d fast=%d slow=%d",
+            RELAY_INITIAL_DELAY_MS, RELAY_FAST_MS, RELAY_SLOW_MS);
     k_work_queue_start(&relay_work_q, relay_work_q_stack,
                        K_THREAD_STACK_SIZEOF(relay_work_q_stack),
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */
