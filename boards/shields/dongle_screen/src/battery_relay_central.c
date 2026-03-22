@@ -56,7 +56,8 @@ struct peripheral_relay {
 
     /* Battery relay GATT characteristic */
     uint16_t bat_char_handle;
-    bool bat_ready;
+    bool bat_ready;          /* characteristic found and usable for writes */
+    bool bat_discovery_done; /* battery discovery has been attempted */
 
     /* Layer relay GATT characteristic */
     uint16_t layer_char_handle;
@@ -75,8 +76,8 @@ struct peripheral_relay {
 /* Delay before starting GATT discovery after connection.
  * ZMK's split stack also does GATT discovery on connect;
  * starting a concurrent discovery causes -EBUSY.
- * 2 s gives ZMK time to complete its own setup first. */
-#define RELAY_DISCOVERY_DELAY_MS 2000
+ * 5 s gives ZMK plenty of time to complete its own setup first. */
+#define RELAY_DISCOVERY_DELAY_MS 5000
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -196,6 +197,10 @@ static void layer_broadcast_work_handler(struct k_work *work) {
 
 /* -------------------------------------------------------------------------
  * GATT discovery — battery first, then layer (chained)
+ *
+ * IMPORTANT: Discovery callbacks run in BT RX thread context.  Never call
+ * bt_gatt_discover() directly from within a callback — always defer to the
+ * system work queue via discovery_work to avoid re-entering the GATT stack.
  * ---------------------------------------------------------------------- */
 
 static void start_layer_discovery(struct peripheral_relay *relay);
@@ -270,22 +275,23 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
         if (!relay->bat_ready) {
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
         }
-        /* Chain: now discover layer relay characteristic.
-         * Guard against disconnect race — conn may have been cleared. */
-        if (relay->conn != NULL) {
-            start_layer_discovery(relay);
-        }
+        /* Mark battery discovery as attempted so work handler proceeds
+         * to layer discovery.  Always defer via work queue — never call
+         * bt_gatt_discover from inside a GATT callback. */
+        relay->bat_discovery_done = true;
+        k_work_schedule(&relay->discovery_work, K_MSEC(100));
         return BT_GATT_ITER_STOP;
     }
 
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready = true;
+    relay->bat_discovery_done = true;
     LOG_INF("battery_relay: characteristic found, handle=%u", relay->bat_char_handle);
 
     /* Chain: discover layer relay characteristic next.
      * Schedule via work queue so current GATT discovery fully completes first. */
-    k_work_schedule(&relay->discovery_work, K_NO_WAIT);
+    k_work_schedule(&relay->discovery_work, K_MSEC(100));
 
     return BT_GATT_ITER_STOP;
 }
@@ -316,7 +322,7 @@ static void discovery_work_handler(struct k_work *work) {
     if (relay->conn == NULL) {
         return;
     }
-    if (!relay->bat_ready) {
+    if (!relay->bat_discovery_done) {
         start_battery_discovery(relay);
     } else if (!relay->layer_ready) {
         start_layer_discovery(relay);
@@ -349,9 +355,13 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
         return;
     }
 
-    /* Only handle LE connections (split peripherals are always LE) */
+    /* Only handle connections where we are the central (split peripherals).
+     * Ignore connections where we are the peripheral (e.g. BLE HID to host). */
     struct bt_conn_info info;
     if (bt_conn_get_info(conn, &info) < 0 || info.type != BT_CONN_TYPE_LE) {
+        return;
+    }
+    if (info.role != BT_HCI_ROLE_CENTRAL) {
         return;
     }
 
@@ -363,6 +373,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
 
     relay->conn = bt_conn_ref(conn);
     relay->bat_ready = false;
+    relay->bat_discovery_done = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
     relay->layer_char_handle = 0;
@@ -385,6 +396,7 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_conn_unref(relay->conn);
     relay->conn = NULL;
     relay->bat_ready = false;
+    relay->bat_discovery_done = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
     relay->layer_char_handle = 0;
