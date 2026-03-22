@@ -15,6 +15,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/endpoints.h>
 #include <zmk/keymap.h>
 
+#include "../battery_relay_central.h"
+
 static sys_slist_t widgets = SYS_SLIST_STATIC_INIT(&widgets);
 
 struct layer_status_state
@@ -57,7 +59,12 @@ static void layer_status_update_cb(struct layer_status_state state)
 
 static struct layer_status_state layer_status_get_state(const zmk_event_t *eh)
 {
+#if IS_ENABLED(CONFIG_DONGLE_SCREEN_BATTERY_RELAY) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    /* On peripheral builds, use the layer index relayed from the central */
+    uint8_t index = battery_relay_get_layer();
+#else
     uint8_t index = zmk_keymap_highest_layer_active();
+#endif
     return (struct layer_status_state){
         .index = index,
         .label = zmk_keymap_layer_name(index)};
