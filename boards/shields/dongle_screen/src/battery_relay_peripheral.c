@@ -72,6 +72,15 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
         return len;
     }
 
+    /* Layer data is multiplexed through this characteristic.
+     * source=0xFE means level contains the active layer index.
+     * Currently accepted silently — layer display on peripherals is
+     * driven by local keymap state via the layer_status widget. */
+    if (data->source == BATTERY_RELAY_SOURCE_LAYER) {
+        LOG_DBG("relay: received layer=%u", data->level);
+        return len;
+    }
+
     if (data->source >= CONFIG_DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT) {
         LOG_WRN("battery_relay: source %u out of range (max %d)",
                 data->source, CONFIG_DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT - 1);
