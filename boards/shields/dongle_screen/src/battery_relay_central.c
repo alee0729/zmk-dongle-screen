@@ -69,15 +69,25 @@ struct peripheral_relay {
     struct k_work_delayable discovery_work;
     uint8_t discovery_retries;
 
-    /* Deferred push after discovery completes */
+    /* Deferred push after discovery completes — walks through cached
+     * battery sources one at a time with RELAY_WRITE_SPACING_MS between
+     * writes, then sends the layer as the final step. */
     struct k_work_delayable push_work;
+    uint8_t push_index; /* next battery_cache index to push, or
+                         * ARRAY_SIZE(battery_cache) = push layer,
+                         * > ARRAY_SIZE(battery_cache) = done */
 };
 
 /* Delay before starting GATT discovery after connection.
  * ZMK's split stack also does GATT discovery on connect;
  * starting a concurrent discovery causes -EBUSY.
- * 5 s gives ZMK plenty of time to complete its own setup first. */
-#define RELAY_DISCOVERY_DELAY_MS 5000
+ *
+ * After sleep/wake reconnection ZMK's split stack may take longer to
+ * fully re-subscribe to HID notifications (security re-establishment,
+ * service-changed handling, etc.).  Zephyr only allows one outstanding
+ * ATT request per connection — our discovery blocks ALL other ATT
+ * operations on that link.  10 s gives ZMK ample headroom. */
+#define RELAY_DISCOVERY_DELAY_MS 10000
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -85,6 +95,16 @@ struct peripheral_relay {
 /* Retry parameters for GATT discovery when it fails (e.g. -EBUSY). */
 #define MAX_DISCOVERY_RETRIES 5
 #define DISCOVERY_RETRY_BASE_MS 1000
+
+/* Delay between battery discovery completing and layer discovery starting.
+ * This gap lets ZMK's split stack (or any other ATT client) perform
+ * operations on the connection without being blocked by our discovery. */
+#define RELAY_INTER_DISCOVERY_DELAY_MS 2000
+
+/* Delay between individual GATT writes when pushing cached state.
+ * Rapid-fire bt_gatt_write_without_response calls can exhaust BLE TX
+ * buffers and starve ZMK's split HID communication. */
+#define RELAY_WRITE_SPACING_MS 50
 
 /* Minimum interval between layer broadcasts (ms).  Momentary layer taps
  * generate rapid activate/deactivate pairs; debouncing avoids flooding
@@ -163,30 +183,43 @@ static void broadcast_layer(uint8_t layer) {
     }
 }
 
-/** Push all cached state to a single peripheral after discovery completes. */
-static void push_cached_state(struct peripheral_relay *relay) {
-    if (relay->conn == NULL) {
-        return;
-    }
-    /* Push all cached battery levels */
-    for (int i = 0; i < ARRAY_SIZE(battery_cache); i++) {
-        if (battery_cache[i] > 0) {
-            write_battery_to_relay(relay, (uint8_t)i, battery_cache[i]);
-        }
-    }
-
-    /* Push current layer */
-    write_layer_to_relay(relay, layer_cache);
-}
-
+/**
+ * Push cached state to a single peripheral one write at a time.
+ *
+ * Each invocation sends at most one GATT write, then reschedules itself
+ * after RELAY_WRITE_SPACING_MS.  This avoids a burst of rapid-fire
+ * bt_gatt_write_without_response() calls that can exhaust BLE TX buffers
+ * and starve ZMK's split HID communication.
+ */
 static void push_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct peripheral_relay *relay = CONTAINER_OF(dwork, struct peripheral_relay, push_work);
-    push_cached_state(relay);
+
+    if (relay->conn == NULL) {
+        return;
+    }
+
+    /* Walk through battery_cache entries, skipping empty ones */
+    while (relay->push_index < ARRAY_SIZE(battery_cache)) {
+        uint8_t idx = relay->push_index++;
+        if (battery_cache[idx] > 0) {
+            write_battery_to_relay(relay, idx, battery_cache[idx]);
+            /* Reschedule for next entry after a spacing delay */
+            k_work_schedule(&relay->push_work, K_MSEC(RELAY_WRITE_SPACING_MS));
+            return;
+        }
+    }
+
+    /* All battery entries done — push current layer as the final write */
+    if (relay->push_index == ARRAY_SIZE(battery_cache)) {
+        relay->push_index++;
+        write_layer_to_relay(relay, layer_cache);
+    }
 }
 
 /** Schedule a deferred push of cached state (avoids writing during discovery). */
 static void schedule_push_cached_state(struct peripheral_relay *relay) {
+    relay->push_index = 0;
     k_work_schedule(&relay->push_work, K_MSEC(200));
 }
 
@@ -277,9 +310,22 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
         }
         /* Mark battery discovery as attempted so work handler proceeds
          * to layer discovery.  Always defer via work queue — never call
-         * bt_gatt_discover from inside a GATT callback. */
+         * bt_gatt_discover from inside a GATT callback.
+         *
+         * If battery relay was not found, skip layer discovery entirely —
+         * if the peripheral doesn't have the battery relay service it
+         * won't have the layer relay either, and a full GATT database
+         * scan for a non-existent characteristic needlessly occupies the
+         * ATT channel, potentially blocking ZMK's split HID operations. */
         relay->bat_discovery_done = true;
-        k_work_schedule(&relay->discovery_work, K_MSEC(100));
+        if (relay->bat_ready) {
+            k_work_schedule(&relay->discovery_work,
+                            K_MSEC(RELAY_INTER_DISCOVERY_DELAY_MS));
+        } else {
+            LOG_DBG("battery_relay: skipping layer discovery — no battery "
+                     "relay on this peripheral");
+            schedule_push_cached_state(relay);
+        }
         return BT_GATT_ITER_STOP;
     }
 
@@ -290,8 +336,11 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
     LOG_INF("battery_relay: characteristic found, handle=%u", relay->bat_char_handle);
 
     /* Chain: discover layer relay characteristic next.
-     * Schedule via work queue so current GATT discovery fully completes first. */
-    k_work_schedule(&relay->discovery_work, K_MSEC(100));
+     * Schedule via work queue so current GATT discovery fully completes
+     * first, with a generous delay so the ATT channel is free for ZMK's
+     * split stack to perform any pending operations. */
+    k_work_schedule(&relay->discovery_work,
+                    K_MSEC(RELAY_INTER_DISCOVERY_DELAY_MS));
 
     return BT_GATT_ITER_STOP;
 }
