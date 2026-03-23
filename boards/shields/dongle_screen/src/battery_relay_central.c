@@ -11,14 +11,17 @@
  *      bt_conn_foreach, attempts GATT discovery on any whose relay handle
  *      is not yet known, then writes cached state to all discovered ones.
  *
- * DESIGN PRINCIPLE: Zero code at connection time.
+ * DESIGN PRINCIPLE: Zero interference with ZMK's split stack.
  * ZMK's split stack does extensive GATT work on connect (service discovery,
  * HID notification subscription, security, connection parameter negotiation).
- * Even registering a BT_CONN_CB connected callback that calls bt_conn_ref()
- * can interfere with the second peripheral's connection setup.
+ * Even calling bt_conn_ref() on a connection being set up can interfere
+ * with the second peripheral's connection — holding a ref on a connection
+ * whose setup fails prevents the connection object from being freed,
+ * exhausting the tiny BLE connection pool.
  *
- * Instead, connections are discovered lazily via bt_conn_foreach in the
- * periodic handler, which runs on a dedicated low-priority work queue.
+ * Therefore, connections are only captured (bt_conn_ref) AFTER all expected
+ * peripherals are connected.  During the waiting phase, we only count
+ * connections — no refs, no pointer storage, no GATT calls.
  *
  * Both battery and layer data are multiplexed through the single battery
  * relay GATT characteristic.  Layer data uses source=BATTERY_RELAY_SOURCE_LAYER
@@ -97,9 +100,7 @@ struct peripheral_relay {
 #define RELAY_SLOW_MS 30000
 
 /* Initial delay before the first periodic cycle (ms).
- * Gives ZMK's split stack a head-start on establishing connections.
- * Per-connection settle time (RELAY_CONN_SETTLE_MS) provides the
- * actual safety gate before discovery is attempted. */
+ * Gives ZMK's split stack a head-start on establishing connections. */
 #define RELAY_INITIAL_DELAY_MS 5000
 
 /* Delay between individual GATT writes during periodic broadcast.
@@ -111,12 +112,10 @@ struct peripheral_relay {
  * the BLE TX buffers which can starve ZMK's split communication. */
 #define LAYER_BROADCAST_DEBOUNCE_MS 100
 
-/* Time (ms) to wait after a connection is first seen before attempting
+/* Time (ms) to wait after connections are captured before attempting
  * GATT discovery.  ZMK's split stack performs its own GATT operations on
  * connect (service discovery, HID subscription, security negotiation).
- * Calling bt_gatt_discover during this window can interfere with ZMK's
- * setup and stall the connection.  This cooldown ensures we only discover
- * after ZMK has finished. */
+ * This cooldown ensures we only discover after ZMK has finished. */
 #define RELAY_CONN_SETTLE_MS 5000
 
 /* Maximum time (ms) to wait for all expected peripherals before proceeding
@@ -126,9 +125,17 @@ struct peripheral_relay {
 
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
-/* Timestamp of first connection seen; used to implement the
- * RELAY_ALL_CONNECT_TIMEOUT_MS fallback.  0 = no connection yet. */
+/* True once we've captured (bt_conn_ref'd) the connections into the relay
+ * array.  Before this, we only count connections — zero interaction. */
+static bool connections_captured;
+
+/* Timestamp when we first saw at least one central connection.
+ * Used for the all-connect timeout.  0 = no connection seen yet. */
 static int64_t first_conn_seen_at;
+
+/* Timestamp when connections were captured into the relay array.
+ * Used for the per-connection settle time before GATT discovery. */
+static int64_t connections_captured_at;
 
 /* Forward declarations for work items used across sections */
 static void periodic_handler(struct k_work *work);
@@ -139,12 +146,34 @@ static void layer_broadcast_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(layer_broadcast_work, layer_broadcast_work_handler);
 
 /* -------------------------------------------------------------------------
- * Connection scanning — find peripheral connections lazily.
+ * Connection counting — lightweight, no bt_conn_ref, no pointer storage.
  *
- * Instead of using BT_CONN_CB_DEFINE (which runs code at connection time
- * and can interfere with ZMK's split stack setup), we scan for connections
- * periodically using bt_conn_foreach.  This guarantees zero interference
- * with connection establishment.
+ * Used during the waiting phase to check how many peripherals are
+ * connected without interfering with ZMK's connection management.
+ * ---------------------------------------------------------------------- */
+
+static void conn_count_cb(struct bt_conn *conn, void *user_data) {
+    int *count = user_data;
+    struct bt_conn_info info;
+
+    if (bt_conn_get_info(conn, &info) < 0) {
+        return;
+    }
+    if (info.role != BT_HCI_ROLE_CENTRAL) {
+        return;
+    }
+    (*count)++;
+}
+
+static int count_central_connections(void) {
+    int count = 0;
+    bt_conn_foreach(BT_CONN_TYPE_LE, conn_count_cb, &count);
+    return count;
+}
+
+/* -------------------------------------------------------------------------
+ * Connection capture — called ONCE after all peripherals are connected
+ * (or timeout).  This is the only place bt_conn_ref is called.
  * ---------------------------------------------------------------------- */
 
 struct conn_scan_data {
@@ -172,10 +201,36 @@ static void conn_scan_cb(struct bt_conn *conn, void *user_data) {
     scan->active[scan->count++] = conn;
 }
 
+/** Capture all current central connections into the relay array.
+ *  Called once after all peripherals are connected (or timeout). */
+static void capture_connections(void) {
+    struct conn_scan_data scan = { .count = 0 };
+    bt_conn_foreach(BT_CONN_TYPE_LE, conn_scan_cb, &scan);
+
+    int64_t now = k_uptime_get();
+    for (int s = 0; s < scan.count; s++) {
+        for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+            if (relays[i].conn == NULL) {
+                relays[i].conn = bt_conn_ref(scan.active[s]);
+                relays[i].bat_ready = false;
+                relays[i].bat_discovery_done = false;
+                relays[i].bat_char_handle = 0;
+                relays[i].discovery_in_flight = false;
+                relays[i].conn_added_at = now;
+                LOG_INF("relay: captured peripheral connection, slot %d", i);
+                break;
+            }
+        }
+    }
+
+    connections_captured = true;
+    connections_captured_at = now;
+    LOG_INF("relay: captured %d connections", scan.count);
+}
+
 /** Synchronize relay array with currently active BLE connections.
- *  - Adds new connections (with bt_conn_ref)
- *  - Removes stale relay entries for disconnected peripherals
- *  Called from periodic handler on relay_work_q. */
+ *  Called from periodic handler AFTER connections have been captured.
+ *  Detects disconnected peripherals and picks up reconnections. */
 static void sync_relay_connections(void) {
     struct conn_scan_data scan = { .count = 0 };
 
@@ -196,28 +251,13 @@ static void sync_relay_connections(void) {
         }
 
         if (!still_active) {
-            LOG_DBG("relay: peripheral disconnected, clearing slot %d", i);
+            LOG_INF("relay: peripheral disconnected, clearing slot %d", i);
             bt_conn_unref(relays[i].conn);
             relays[i].conn = NULL;
             relays[i].bat_ready = false;
             relays[i].bat_discovery_done = false;
             relays[i].bat_char_handle = 0;
             relays[i].discovery_in_flight = false;
-        }
-    }
-
-    /* Reset first-connection timestamp when all peripherals disconnect,
-     * so the all-connect timeout works correctly on the next power cycle. */
-    if (first_conn_seen_at > 0) {
-        bool any_conn = false;
-        for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-            if (relays[i].conn != NULL) {
-                any_conn = true;
-                break;
-            }
-        }
-        if (!any_conn) {
-            first_conn_seen_at = 0;
         }
     }
 
@@ -232,7 +272,6 @@ static void sync_relay_connections(void) {
         }
 
         if (!found) {
-            /* Find a free slot */
             for (int i = 0; i < ARRAY_SIZE(relays); i++) {
                 if (relays[i].conn == NULL) {
                     relays[i].conn = bt_conn_ref(scan.active[s]);
@@ -241,10 +280,7 @@ static void sync_relay_connections(void) {
                     relays[i].bat_char_handle = 0;
                     relays[i].discovery_in_flight = false;
                     relays[i].conn_added_at = k_uptime_get();
-                    if (first_conn_seen_at == 0) {
-                        first_conn_seen_at = relays[i].conn_added_at;
-                    }
-                    LOG_INF("relay: found peripheral connection, slot %d", i);
+                    LOG_INF("relay: found new peripheral connection, slot %d", i);
                     break;
                 }
             }
@@ -328,10 +364,9 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
         return false;
     }
 
-    /* Wait for ZMK's split stack to finish its own GATT setup on this
-     * connection before we start our discovery.  Attempting discovery too
-     * early can interfere with ZMK's service discovery / security
-     * negotiation and stall the connection entirely. */
+    /* Wait for ZMK's split stack to finish its own GATT setup before
+     * we start ours.  Attempting discovery too early can interfere with
+     * ZMK's service discovery / security negotiation. */
     if (k_uptime_get() - relay->conn_added_at < RELAY_CONN_SETTLE_MS) {
         LOG_DBG("relay: conn %p still settling, deferring discovery", (void *)relay->conn);
         return false;
@@ -356,18 +391,65 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
 /* -------------------------------------------------------------------------
  * Periodic handler — connection scan + discovery + broadcast.
  *
- * Runs on relay_work_q.  While any relay needs discovery, runs every 5 s.
- * Once all relays are discovered, slows to 30 s (battery refresh only).
- * Each cycle:
- * 1. Scans for new/disconnected peripherals via bt_conn_foreach.
- * 2. Waits for all expected peripherals (or timeout) before GATT work.
- * 3. Tries discovery on one undiscovered relay per cycle.
- * 4. Writes cached battery + layer state to all discovered relays with
- *    spacing between writes to avoid TX buffer exhaustion.
+ * Two phases:
+ *
+ * WAITING PHASE (connections_captured == false):
+ *   Only counts central connections via bt_conn_foreach — no bt_conn_ref,
+ *   no pointer storage, no GATT calls.  This ensures zero interference
+ *   with ZMK's scanning and connection setup.  Transitions to active
+ *   phase when all expected peripherals are connected OR timeout.
+ *
+ * ACTIVE PHASE (connections_captured == true):
+ *   Syncs relay array, runs GATT discovery, writes cached state.
+ *   Runs every 5 s while discovering, 30 s once all relays are ready.
  * ---------------------------------------------------------------------- */
 
 static void periodic_handler(struct k_work *work) {
-    /* Step 1: Sync relay array with current BLE connections */
+
+    /* ---- WAITING PHASE: hands off, just count ---- */
+    if (!connections_captured) {
+        int count = count_central_connections();
+
+        if (count > 0 && first_conn_seen_at == 0) {
+            first_conn_seen_at = k_uptime_get();
+        }
+
+        bool all_connected = (count >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT);
+        bool timed_out = (first_conn_seen_at > 0) &&
+                         (k_uptime_get() - first_conn_seen_at > RELAY_ALL_CONNECT_TIMEOUT_MS);
+
+        if (count > 0 && !all_connected && !timed_out) {
+            LOG_INF("relay: waiting for peripherals: %d/%d connected "
+                    "(%lld s until timeout)",
+                    count, ZMK_SPLIT_BLE_PERIPHERAL_COUNT,
+                    (RELAY_ALL_CONNECT_TIMEOUT_MS -
+                     (k_uptime_get() - first_conn_seen_at)) / 1000);
+            k_work_schedule_for_queue(&relay_work_q, &periodic_work,
+                                      K_MSEC(RELAY_FAST_MS));
+            return;
+        }
+
+        if (count == 0) {
+            /* No connections yet — keep polling */
+            k_work_schedule_for_queue(&relay_work_q, &periodic_work,
+                                      K_MSEC(RELAY_FAST_MS));
+            return;
+        }
+
+        /* All connected (or timeout) — capture connections now */
+        LOG_INF("relay: %d peripherals connected, capturing connections", count);
+        capture_connections();
+
+        /* Give ZMK's GATT setup time to finish on the last connection */
+        k_work_schedule_for_queue(&relay_work_q, &periodic_work,
+                                  K_MSEC(RELAY_CONN_SETTLE_MS));
+        return;
+    }
+
+    /* ---- ACTIVE PHASE: sync, discover, write ---- */
+
+    /* Sync relay array with current connections (detect disconnects,
+     * pick up reconnections) */
     sync_relay_connections();
 
     /* Count connection state */
@@ -382,35 +464,7 @@ static void periodic_handler(struct k_work *work) {
         }
     }
 
-    /* Step 2: Wait for all peripherals before doing any GATT work.
-     *
-     * GATT operations (discovery + writes) consume BLE radio time.
-     * On nRF52, radio time is shared between connection events and
-     * scanning.  If we start GATT traffic on the first connection,
-     * it can starve ZMK's scanner and prevent the second peripheral
-     * from being found.
-     *
-     * Wait until either:
-     *  (a) all expected peripherals are connected, OR
-     *  (b) a timeout has elapsed since the first connection was seen
-     *      (a peripheral may be intentionally off). */
-    bool all_connected = (connected >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT);
-    bool timed_out = (first_conn_seen_at > 0) &&
-                     (k_uptime_get() - first_conn_seen_at > RELAY_ALL_CONNECT_TIMEOUT_MS);
-
-    if (connected > 0 && !all_connected && !timed_out) {
-        LOG_INF("relay: %d/%d peripherals connected, waiting for rest "
-                "(%lld s until timeout)",
-                connected, ZMK_SPLIT_BLE_PERIPHERAL_COUNT,
-                (RELAY_ALL_CONNECT_TIMEOUT_MS -
-                 (k_uptime_get() - first_conn_seen_at)) / 1000);
-        k_work_schedule_for_queue(&relay_work_q, &periodic_work,
-                                  K_MSEC(RELAY_FAST_MS));
-        return;
-    }
-
-    /* Step 3: Try discovery on undiscovered relays (one at a time to
-     * minimize radio contention). */
+    /* Try discovery on undiscovered relays (one at a time) */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (relays[i].conn == NULL) {
             continue;
@@ -421,7 +475,8 @@ static void periodic_handler(struct k_work *work) {
         }
     }
 
-    bool all_ready = all_connected && (ready == connected);
+    bool all_ready = (connected >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT) &&
+                     (ready == connected);
 
     /* Log relay state for diagnostics */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -432,7 +487,7 @@ static void periodic_handler(struct k_work *work) {
         }
     }
 
-    /* Step 4: Write cached state to all discovered relays */
+    /* Write cached state to all discovered relays */
     for (int r = 0; r < ARRAY_SIZE(relays); r++) {
         struct peripheral_relay *relay = &relays[r];
 
@@ -509,17 +564,16 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
  * ---------------------------------------------------------------------- */
 
 static int relay_central_init(void) {
-    LOG_INF("relay: central init, initial_delay=%d fast=%d slow=%d",
-            RELAY_INITIAL_DELAY_MS, RELAY_FAST_MS, RELAY_SLOW_MS);
+    LOG_INF("relay: central init, initial_delay=%d fast=%d slow=%d settle=%d",
+            RELAY_INITIAL_DELAY_MS, RELAY_FAST_MS, RELAY_SLOW_MS, RELAY_CONN_SETTLE_MS);
     k_work_queue_start(&relay_work_q, relay_work_q_stack,
                        K_THREAD_STACK_SIZEOF(relay_work_q_stack),
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */
                        NULL);
 
-    /* First periodic cycle starts quickly just to scan for connections.
-     * GATT operations are deferred until all peripherals are connected
-     * (or timeout), then per-connection settle time ensures ZMK has
-     * finished its own GATT setup before we start ours. */
+    /* Start polling for connections.  During the waiting phase, we only
+     * COUNT connections (no bt_conn_ref, no GATT) to ensure zero
+     * interference with ZMK's scanning and connection setup. */
     k_work_schedule_for_queue(&relay_work_q, &periodic_work,
                               K_MSEC(RELAY_INITIAL_DELAY_MS));
     return 0;
