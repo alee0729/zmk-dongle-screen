@@ -7,13 +7,13 @@
  * ======================================
  * When enabled, the central:
  *   1. Registers BT connection callbacks.
- *   2. On peripheral connect, discovers the battery relay and layer relay
- *      GATT characteristics (sequentially to avoid EBUSY).
+ *   2. On peripheral connect, discovers the battery relay GATT characteristic
+ *      (layer data is multiplexed through it).
  *   3. Subscribes to ZMK battery and layer events.
  *   4. On every battery change, writes struct battery_relay_data to each
  *      connected peripheral that has been successfully discovered.
  *   5. On every layer change, writes the layer index to each
- *      connected peripheral that has a layer relay characteristic.
+ *      connected peripheral via the battery relay characteristic.
  *   6. Caches battery levels and layer index so newly-discovered peripherals
  *      get the current state immediately after GATT discovery completes.
  *   7. Periodically re-broadcasts battery state for resilience against
@@ -58,39 +58,25 @@ static uint8_t dongle_battery_cache;
 struct peripheral_relay {
     struct bt_conn *conn;
 
-    /* Battery relay GATT characteristic */
+    /* Battery relay GATT characteristic (also used for layer data) */
     uint16_t bat_char_handle;
     bool bat_ready;
 
     /* Layer relay — multiplexed through the battery relay characteristic.
-     * layer_ready tracks whether layer data can be written (set after
-     * the layer "discovery" step completes). */
+     * layer_ready is set after discovery completes so layer writes can begin. */
     bool layer_ready;
 
     /* Discovery state */
     struct bt_gatt_discover_params discover_params;
     struct bt_uuid_128 discover_uuid; /* copy kept alive for async discovery */
     struct k_work_delayable discovery_work;
-
-    /* Spaced write state for push_cached_state */
-    struct k_work_delayable push_work;
-    uint8_t push_index; /* next source index to write */
 };
 
 /* Delay before starting GATT discovery after connection.
- * ZMK's split stack also does GATT discovery on connect and subscribes
- * to HID notifications.  After sleep/wake reconnection this can take
- * several seconds (security re-establishment, connection parameter
- * updates, HID re-subscription).  10 s gives ZMK plenty of headroom. */
-#define RELAY_DISCOVERY_DELAY_MS 10000
-
-/* Delay between discovery phases and before pushing cached state.
- * Keeps the ATT channel free for ZMK's split operations. */
-#define RELAY_INTER_PHASE_DELAY_MS 2000
-
-/* Delay between individual GATT writes when pushing cached state.
- * Prevents BLE TX buffer exhaustion that starves ZMK's split traffic. */
-#define RELAY_WRITE_SPACING_MS 50
+ * ZMK's split stack also does GATT discovery on connect;
+ * starting a concurrent discovery causes -EBUSY.
+ * 500 ms gives ZMK time to complete its own setup first. */
+#define RELAY_DISCOVERY_DELAY_MS 500
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -157,70 +143,32 @@ static void broadcast_layer(uint8_t layer) {
     }
 }
 
-/* -------------------------------------------------------------------------
- * Spaced push of cached state — one write per RELAY_WRITE_SPACING_MS
- *
- * After discovery completes we push cached battery levels to the newly
- * connected peripheral, but we space out the writes to avoid exhausting
- * the BLE TX buffer and starving ZMK's split HID traffic.
- * Layer data is NOT pushed here — it is sent on the next layer event
- * (keypress) to avoid extra BLE traffic during the connection window.
- * ---------------------------------------------------------------------- */
-
-static void push_work_handler(struct k_work *work) {
-    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    struct peripheral_relay *relay = CONTAINER_OF(dwork, struct peripheral_relay, push_work);
-
-    if (relay->conn == NULL || !relay->bat_ready) {
-        return;
-    }
-
-    /* Walk through battery_cache starting at push_index */
-    while (relay->push_index < ARRAY_SIZE(battery_cache)) {
-        uint8_t idx = relay->push_index++;
-        if (battery_cache[idx] > 0) {
-            write_battery_to_relay(relay, idx, battery_cache[idx]);
-            /* Reschedule for the next entry after a delay */
-            k_work_schedule(&relay->push_work, K_MSEC(RELAY_WRITE_SPACING_MS));
-            return;
+/** Push all cached state to a single peripheral after discovery completes. */
+static void push_cached_state(struct peripheral_relay *relay) {
+    /* Push all cached battery levels */
+    for (int i = 0; i < ARRAY_SIZE(battery_cache); i++) {
+        if (battery_cache[i] > 0) {
+            write_battery_to_relay(relay, (uint8_t)i, battery_cache[i]);
         }
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
-    /* After all peripheral batteries, push dongle battery (once) */
-    if (relay->push_index == ARRAY_SIZE(battery_cache)) {
-        relay->push_index++;
-        if (dongle_battery_cache > 0) {
-            write_battery_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
-        }
+    if (dongle_battery_cache > 0) {
+        write_battery_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
     }
 #endif
-}
 
-static void start_push_cached_state(struct peripheral_relay *relay) {
-    relay->push_index = 0;
-    k_work_schedule(&relay->push_work, K_MSEC(RELAY_WRITE_SPACING_MS));
+    /* Push current layer */
+    write_layer_to_relay(relay, layer_cache);
 }
 
 /* -------------------------------------------------------------------------
- * GATT discovery — battery first, then layer (chained)
+ * GATT discovery — battery characteristic only
  *
  * Layer data is multiplexed through the battery relay characteristic,
- * so a separate layer "discovery" step is not strictly needed.  However,
- * to preserve the exact same flow and timing as the original
- * implementation, we keep the chained discovery pattern: battery
- * discovery succeeds, then we mark layer_ready and push cached state.
+ * so no separate layer discovery is needed.  After battery discovery
+ * completes we mark layer_ready and push cached state.
  * ---------------------------------------------------------------------- */
-
-static void finish_layer_setup(struct peripheral_relay *relay) {
-    /* Layer is multiplexed through the battery characteristic, so if
-     * battery discovery succeeded, layer is ready too. */
-    if (relay->bat_ready) {
-        relay->layer_ready = true;
-    }
-    /* Discovery complete — push cached state with spaced writes */
-    start_push_cached_state(relay);
-}
 
 static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                       struct bt_gatt_discover_params *params) {
@@ -229,12 +177,10 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
     if (!attr) {
         if (!relay->bat_ready) {
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
-            /* Peripheral doesn't have the relay service — skip layer setup
-             * entirely to avoid unnecessary ATT traffic. */
-        } else {
-            /* Battery found previously, finish layer setup */
-            finish_layer_setup(relay);
         }
+        /* Discovery complete — mark layer ready and push cached state.
+         * Schedule via work queue so current GATT discovery fully completes first. */
+        k_work_schedule(&relay->discovery_work, K_NO_WAIT);
         return BT_GATT_ITER_STOP;
     }
 
@@ -243,9 +189,8 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
     relay->bat_ready = true;
     LOG_INF("battery_relay: characteristic found, handle=%u", relay->bat_char_handle);
 
-    /* Chain: finish layer setup after a delay to keep the ATT channel
-     * free for ZMK's split operations between discovery phases. */
-    k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_INTER_PHASE_DELAY_MS));
+    /* Schedule via work queue so current GATT discovery fully completes first. */
+    k_work_schedule(&relay->discovery_work, K_NO_WAIT);
 
     return BT_GATT_ITER_STOP;
 }
@@ -274,7 +219,10 @@ static void discovery_work_handler(struct k_work *work) {
     if (!relay->bat_ready) {
         start_battery_discovery(relay);
     } else if (!relay->layer_ready) {
-        finish_layer_setup(relay);
+        /* Layer is multiplexed through the battery characteristic,
+         * so no separate discovery needed — just mark ready. */
+        relay->layer_ready = true;
+        push_cached_state(relay);
     }
 }
 
@@ -291,6 +239,17 @@ static void periodic_broadcast_handler(struct k_work *work) {
             broadcast_battery((uint8_t)src, battery_cache[src]);
         }
     }
+
+#if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
+    if (dongle_battery_cache > 0) {
+        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+    }
+#endif
+
+    /* Rebroadcast layer — BLE write-without-response can drop packets,
+     * so periodic resend ensures peripherals stay in sync. */
+    broadcast_layer(layer_cache);
+
     /* Reschedule */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
 }
@@ -320,10 +279,8 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
-    relay->push_index = 0;
 
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
-    k_work_init_delayable(&relay->push_work, push_work_handler);
     k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_DELAY_MS));
 }
 
@@ -335,7 +292,6 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_DBG("relay: peripheral disconnected (reason %u), clearing slot", reason);
     k_work_cancel_delayable(&relay->discovery_work);
-    k_work_cancel_delayable(&relay->push_work);
     bt_conn_unref(relay->conn);
     relay->conn = NULL;
     relay->bat_ready = false;
@@ -356,6 +312,8 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
+        LOG_INF("relay_central: peripheral battery event source=%u level=%u",
+                periph_ev->source, periph_ev->state_of_charge);
         /* Cache before broadcasting */
         if (periph_ev->source < ARRAY_SIZE(battery_cache)) {
             battery_cache[periph_ev->source] = periph_ev->state_of_charge;

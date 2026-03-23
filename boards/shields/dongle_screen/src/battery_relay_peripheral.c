@@ -84,16 +84,14 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
      * Store it and raise zmk_layer_state_changed so the layer_status
      * widget redraws with the relayed value. */
     if (data->source == BATTERY_RELAY_SOURCE_LAYER) {
-        if (data->level != relayed_layer) {
-            relayed_layer = data->level;
-            LOG_DBG("relay: layer=%u", relayed_layer);
-            ZMK_EVENT_RAISE(new_zmk_layer_state_changed(
-                (struct zmk_layer_state_changed){
-                    .layer = relayed_layer,
-                    .state = true,
-                    .timestamp = k_uptime_get(),
-                }));
-        }
+        relayed_layer = data->level;
+        LOG_DBG("relay: layer=%u", relayed_layer);
+        ZMK_EVENT_RAISE(new_zmk_layer_state_changed(
+            (struct zmk_layer_state_changed){
+                .layer = relayed_layer,
+                .state = true,
+                .timestamp = k_uptime_get(),
+            }));
         return len;
     }
 
