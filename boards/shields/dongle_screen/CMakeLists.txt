@@ -23,7 +23,6 @@ if(CONFIG_SHIELD_DONGLE_SCREEN)
     zephyr_library_sources(src/battery_relay_central.c)
   endif()
 
-  if(CONFIG_DONGLE_SCREEN_BATTERY_RELAY AND NOT CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    zephyr_library_sources(src/battery_relay_peripheral.c)
-  endif()
+  # battery_relay_peripheral.c is compiled at module level (root CMakeLists.txt)
+  # so it works even without the dongle_screen shield selected.
 endif()
