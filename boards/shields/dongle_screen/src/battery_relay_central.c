@@ -70,13 +70,24 @@ struct peripheral_relay {
     struct bt_gatt_discover_params discover_params;
     struct bt_uuid_128 discover_uuid; /* copy kept alive for async discovery */
     struct k_work_delayable discovery_work;
+    uint8_t discover_retries;        /* remaining retries on transient errors */
 };
 
 /* Delay before starting GATT discovery after connection.
  * ZMK's split stack also does GATT discovery on connect;
  * starting a concurrent discovery causes -EBUSY.
- * 500 ms gives ZMK time to complete its own setup first. */
-#define RELAY_DISCOVERY_DELAY_MS 500
+ * 2000 ms gives ZMK time to complete its own setup first. */
+#define RELAY_DISCOVERY_DELAY_MS 2000
+
+/* Extra stagger per relay-slot index so peripherals that connect
+ * simultaneously don't start GATT discovery at the same time. */
+#define RELAY_DISCOVERY_STAGGER_MS 2000
+
+/* How many times to retry bt_gatt_discover on transient errors. */
+#define RELAY_DISCOVERY_MAX_RETRIES 5
+
+/* Delay between discovery retries (ms). */
+#define RELAY_DISCOVERY_RETRY_DELAY_MS 2000
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -99,6 +110,10 @@ static struct peripheral_relay *get_free_relay(void) {
         }
     }
     return NULL;
+}
+
+static int get_relay_index(const struct peripheral_relay *relay) {
+    return (int)(relay - relays);
 }
 
 /* -------------------------------------------------------------------------
@@ -177,10 +192,18 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
     if (!attr) {
         if (!relay->bat_ready) {
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
+            /* Retry with delay if retries remain, otherwise give up */
+            if (relay->discover_retries > 0) {
+                relay->discover_retries--;
+                k_work_schedule(&relay->discovery_work,
+                                K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+            } else {
+                LOG_ERR("battery_relay: giving up discovery on conn %p", (void *)conn);
+            }
+        } else {
+            /* Discovery succeeded — proceed to mark layer_ready */
+            k_work_schedule(&relay->discovery_work, K_NO_WAIT);
         }
-        /* Discovery complete — mark layer ready and push cached state.
-         * Schedule via work queue so current GATT discovery fully completes first. */
-        k_work_schedule(&relay->discovery_work, K_NO_WAIT);
         return BT_GATT_ITER_STOP;
     }
 
@@ -206,7 +229,15 @@ static void start_battery_discovery(struct peripheral_relay *relay) {
 
     int err = bt_gatt_discover(relay->conn, &relay->discover_params);
     if (err) {
-        LOG_ERR("battery_relay: bt_gatt_discover failed: %d", err);
+        LOG_ERR("battery_relay: bt_gatt_discover failed: %d (retries left %u)",
+                err, relay->discover_retries);
+        /* Retry on transient errors */
+        if (relay->discover_retries > 0 &&
+            (err == -EBUSY || err == -ENOMEM || err == -EAGAIN)) {
+            relay->discover_retries--;
+            k_work_schedule(&relay->discovery_work,
+                            K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+        }
     }
 }
 
@@ -268,6 +299,11 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     if (bt_conn_get_info(conn, &info) < 0 || info.type != BT_CONN_TYPE_LE) {
         return;
     }
+    /* Only handle central-role connections (to split peripherals).
+     * Skip host BLE connections where the dongle is a peripheral. */
+    if (info.role != BT_CONN_ROLE_CENTRAL) {
+        return;
+    }
 
     struct peripheral_relay *relay = get_free_relay();
     if (!relay) {
@@ -279,9 +315,16 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
+    relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
 
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
-    k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_DELAY_MS));
+
+    /* Stagger discovery start per relay index so that peripherals
+     * connecting at the same time don't start concurrent GATT
+     * discoveries that compete for ATT buffers. */
+    uint32_t delay = RELAY_DISCOVERY_DELAY_MS +
+                     (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
+    k_work_schedule(&relay->discovery_work, K_MSEC(delay));
 }
 
 static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
