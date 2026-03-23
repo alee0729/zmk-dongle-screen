@@ -22,27 +22,6 @@ config ZMK_DONGLE_DISPLAY_DONGLE_BATTERY
     bool "Show also the battery level of the dongle"
     depends on BT && (!ZMK_SPLIT_BLE || ZMK_SPLIT_ROLE_CENTRAL)
 
-config DONGLE_SCREEN_BATTERY_RELAY
-    bool "Relay battery levels between dongle and keyboard halves"
-    depends on BT && ZMK_SPLIT
-    help
-      When enabled the central (dongle) discovers the battery relay GATT
-      characteristic on each connected peripheral and writes every battery
-      level change to it.  Each peripheral side hosts the GATT service,
-      stores the received levels, and raises zmk_peripheral_battery_state_changed
-      events so the battery_status display widget redraws automatically.
-      Enable on both the central (dongle) and peripheral (keyboard half) builds.
-
-config DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT
-    int "Number of battery sources displayed in peripheral relay mode"
-    default 2
-    range 1 8
-    depends on DONGLE_SCREEN_BATTERY_RELAY && !ZMK_SPLIT_ROLE_CENTRAL
-    help
-      How many battery source slots to allocate in peripheral relay mode.
-      For a standard 2-split keyboard (left + right) use the default of 2.
-      Increase if more splits exist.
-
 choice ZMK_DISPLAY_WORK_QUEUE
     default ZMK_DISPLAY_WORK_QUEUE_DEDICATED
 endchoice
