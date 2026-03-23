@@ -83,6 +83,11 @@ struct peripheral_relay {
 
     /* Set true while an async bt_gatt_discover is in flight */
     bool discovery_in_flight;
+
+    /* Timestamp (uptime ms) when this connection was added to the relay.
+     * Discovery is deferred until RELAY_CONN_SETTLE_MS after this time
+     * to avoid interfering with ZMK's split stack GATT setup. */
+    int64_t conn_added_at;
 };
 
 /* Periodic handler intervals (ms).
@@ -92,8 +97,10 @@ struct peripheral_relay {
 #define RELAY_SLOW_MS 30000
 
 /* Initial delay before the first periodic cycle (ms).
- * Must be long enough for ZMK's split stack to establish connections. */
-#define RELAY_INITIAL_DELAY_MS 15000
+ * Gives ZMK's split stack a head-start on establishing connections.
+ * Per-connection settle time (RELAY_CONN_SETTLE_MS) provides the
+ * actual safety gate before discovery is attempted. */
+#define RELAY_INITIAL_DELAY_MS 5000
 
 /* Delay between individual GATT writes during periodic broadcast.
  * Spaces out writes to avoid exhausting BLE TX buffers in a burst. */
@@ -103,6 +110,14 @@ struct peripheral_relay {
  * generate rapid activate/deactivate pairs; debouncing avoids flooding
  * the BLE TX buffers which can starve ZMK's split communication. */
 #define LAYER_BROADCAST_DEBOUNCE_MS 100
+
+/* Time (ms) to wait after a connection is first seen before attempting
+ * GATT discovery.  ZMK's split stack performs its own GATT operations on
+ * connect (service discovery, HID subscription, security negotiation).
+ * Calling bt_gatt_discover during this window can interfere with ZMK's
+ * setup and stall the connection.  This cooldown ensures we only discover
+ * after ZMK has finished. */
+#define RELAY_CONN_SETTLE_MS 5000
 
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
@@ -201,6 +216,7 @@ static void sync_relay_connections(void) {
                     relays[i].bat_discovery_done = false;
                     relays[i].bat_char_handle = 0;
                     relays[i].discovery_in_flight = false;
+                    relays[i].conn_added_at = k_uptime_get();
                     LOG_INF("relay: found peripheral connection, slot %d", i);
                     break;
                 }
@@ -282,6 +298,15 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
  *  Returns true if a discovery was started (caller should not start another). */
 static bool try_discovery_step(struct peripheral_relay *relay) {
     if (relay->conn == NULL || relay->discovery_in_flight || relay->bat_discovery_done) {
+        return false;
+    }
+
+    /* Wait for ZMK's split stack to finish its own GATT setup on this
+     * connection before we start our discovery.  Attempting discovery too
+     * early can interfere with ZMK's service discovery / security
+     * negotiation and stall the connection entirely. */
+    if (k_uptime_get() - relay->conn_added_at < RELAY_CONN_SETTLE_MS) {
+        LOG_DBG("relay: conn %p still settling, deferring discovery", (void *)relay->conn);
         return false;
     }
 
