@@ -106,6 +106,10 @@ struct peripheral_relay {
 
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
+/* Forward declarations for work items used across sections */
+static void periodic_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(periodic_work, periodic_handler);
+
 /* Debounced layer broadcast — runs on relay_work_q */
 static void layer_broadcast_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(layer_broadcast_work, layer_broadcast_work_handler);
@@ -225,6 +229,11 @@ static void write_to_relay(struct peripheral_relay *relay, uint8_t source, uint8
         LOG_WRN("relay: write failed (source=%u): %d", source, err);
         if (err == -ENOTCONN) {
             relay->bat_ready = false;
+            /* Reschedule periodic handler quickly so sync_relay_connections()
+             * detects the disconnect and cleans up the stale slot, rather
+             * than waiting up to RELAY_SLOW_MS (30 s). */
+            k_work_reschedule_for_queue(&relay_work_q, &periodic_work,
+                                        K_MSEC(RELAY_FAST_MS));
         }
     }
 }
@@ -303,9 +312,6 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
  * 3. Writes cached battery + layer state to all discovered relays with
  *    spacing between writes to avoid TX buffer exhaustion.
  * ---------------------------------------------------------------------- */
-
-static void periodic_handler(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(periodic_work, periodic_handler);
 
 static void periodic_handler(struct k_work *work) {
     /* Step 1: Sync relay array with current BLE connections */
