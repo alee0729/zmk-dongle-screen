@@ -28,7 +28,6 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/logging/log.h>
 
-#include <zmk/split/central.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/event_manager.h>
@@ -44,7 +43,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * periodically re-broadcast for resilience.
  * ---------------------------------------------------------------------- */
 
-static uint8_t battery_cache[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static uint8_t layer_cache;
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
@@ -92,7 +91,7 @@ struct peripheral_relay {
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
 
-static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -325,6 +324,11 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     uint32_t delay = RELAY_DISCOVERY_DELAY_MS +
                      (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
     k_work_schedule(&relay->discovery_work, K_MSEC(delay));
+
+    /* Start the periodic rebroadcast timer the first time a peripheral connects.
+     * k_work_schedule is a no-op if the work is already pending, so calling it on
+     * every connection is safe and ensures the timer is always running. */
+    k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
 }
 
 static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
@@ -393,13 +397,3 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
 #endif
 
-/* -------------------------------------------------------------------------
- * Init — start periodic rebroadcast timer
- * ---------------------------------------------------------------------- */
-
-static int relay_central_init(void) {
-    k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
-    return 0;
-}
-
-SYS_INIT(relay_central_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
