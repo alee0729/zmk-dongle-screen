@@ -10,7 +10,7 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/display.h>
-#include <zmk/event_manager.h>
+#include <zmk/event-manager.h>
 #include <zmk/events/wpm_state_changed.h>
 
 #include "wpm_status.h"

@@ -5,7 +5,7 @@
 #include <zephyr/drivers/display.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/logging/log.h>
-#include <zmk/event_manager.h>
+#include <zmk/event-manager.h>
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <math.h>
