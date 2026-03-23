@@ -19,10 +19,9 @@ if(CONFIG_SHIELD_DONGLE_SCREEN)
   file(GLOB font_sources src/fonts/*.c)
   zephyr_library_sources(${font_sources})
 
-  if(CONFIG_DONGLE_SCREEN_BATTERY_RELAY AND CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
-    zephyr_library_sources(src/battery_relay_central.c)
-  endif()
-
-  # battery_relay_peripheral.c is compiled at module level (root CMakeLists.txt)
-  # so it works even without the dongle_screen shield selected.
+  # battery_relay_central.c is compiled at module level (root CMakeLists.txt)
+  # so it works even without the dongle_screen shield selected and avoids
+  # duplicate symbols when a keyboard shield (e.g. toucan) also enables
+  # DONGLE_SCREEN_BATTERY_RELAY and compiles its own central.
+  # battery_relay_peripheral.c is also compiled at module level.
 endif()
