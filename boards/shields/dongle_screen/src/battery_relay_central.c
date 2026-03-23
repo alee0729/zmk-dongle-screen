@@ -239,6 +239,17 @@ static void periodic_broadcast_handler(struct k_work *work) {
             broadcast_battery((uint8_t)src, battery_cache[src]);
         }
     }
+
+#if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
+    if (dongle_battery_cache > 0) {
+        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+    }
+#endif
+
+    /* Rebroadcast layer — BLE write-without-response can drop packets,
+     * so periodic resend ensures peripherals stay in sync. */
+    broadcast_layer(layer_cache);
+
     /* Reschedule */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
 }
@@ -301,6 +312,8 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
+        LOG_INF("relay_central: peripheral battery event source=%u level=%u",
+                periph_ev->source, periph_ev->state_of_charge);
         /* Cache before broadcasting */
         if (periph_ev->source < ARRAY_SIZE(battery_cache)) {
             battery_cache[periph_ev->source] = periph_ev->state_of_charge;
