@@ -119,7 +119,16 @@ struct peripheral_relay {
  * after ZMK has finished. */
 #define RELAY_CONN_SETTLE_MS 5000
 
+/* Maximum time (ms) to wait for all expected peripherals before proceeding
+ * with discovery on whichever are connected.  Prevents indefinite waiting
+ * if a peripheral is intentionally off or unreachable. */
+#define RELAY_ALL_CONNECT_TIMEOUT_MS 30000
+
 static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+
+/* Timestamp of first connection seen; used to implement the
+ * RELAY_ALL_CONNECT_TIMEOUT_MS fallback.  0 = no connection yet. */
+static int64_t first_conn_seen_at;
 
 /* Forward declarations for work items used across sections */
 static void periodic_handler(struct k_work *work);
@@ -197,6 +206,21 @@ static void sync_relay_connections(void) {
         }
     }
 
+    /* Reset first-connection timestamp when all peripherals disconnect,
+     * so the all-connect timeout works correctly on the next power cycle. */
+    if (first_conn_seen_at > 0) {
+        bool any_conn = false;
+        for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+            if (relays[i].conn != NULL) {
+                any_conn = true;
+                break;
+            }
+        }
+        if (!any_conn) {
+            first_conn_seen_at = 0;
+        }
+    }
+
     /* Add new connections that aren't in the relay array yet */
     for (int s = 0; s < scan.count; s++) {
         bool found = false;
@@ -217,6 +241,9 @@ static void sync_relay_connections(void) {
                     relays[i].bat_char_handle = 0;
                     relays[i].discovery_in_flight = false;
                     relays[i].conn_added_at = k_uptime_get();
+                    if (first_conn_seen_at == 0) {
+                        first_conn_seen_at = relays[i].conn_added_at;
+                    }
                     LOG_INF("relay: found peripheral connection, slot %d", i);
                     break;
                 }
@@ -333,8 +360,9 @@ static bool try_discovery_step(struct peripheral_relay *relay) {
  * Once all relays are discovered, slows to 30 s (battery refresh only).
  * Each cycle:
  * 1. Scans for new/disconnected peripherals via bt_conn_foreach.
- * 2. Tries discovery on ALL undiscovered peripherals.
- * 3. Writes cached battery + layer state to all discovered relays with
+ * 2. Waits for all expected peripherals (or timeout) before GATT work.
+ * 3. Tries discovery on one undiscovered relay per cycle.
+ * 4. Writes cached battery + layer state to all discovered relays with
  *    spacing between writes to avoid TX buffer exhaustion.
  * ---------------------------------------------------------------------- */
 
@@ -342,27 +370,58 @@ static void periodic_handler(struct k_work *work) {
     /* Step 1: Sync relay array with current BLE connections */
     sync_relay_connections();
 
-    /* Step 2: Try discovery on ALL undiscovered relays.
-     * Each relay has its own discover_params and they're on separate
-     * connections, so concurrent discoveries are safe. */
+    /* Count connection state */
     int connected = 0;
     int ready = 0;
+    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+        if (relays[i].conn != NULL) {
+            connected++;
+            if (relays[i].bat_ready) {
+                ready++;
+            }
+        }
+    }
+
+    /* Step 2: Wait for all peripherals before doing any GATT work.
+     *
+     * GATT operations (discovery + writes) consume BLE radio time.
+     * On nRF52, radio time is shared between connection events and
+     * scanning.  If we start GATT traffic on the first connection,
+     * it can starve ZMK's scanner and prevent the second peripheral
+     * from being found.
+     *
+     * Wait until either:
+     *  (a) all expected peripherals are connected, OR
+     *  (b) a timeout has elapsed since the first connection was seen
+     *      (a peripheral may be intentionally off). */
+    bool all_connected = (connected >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT);
+    bool timed_out = (first_conn_seen_at > 0) &&
+                     (k_uptime_get() - first_conn_seen_at > RELAY_ALL_CONNECT_TIMEOUT_MS);
+
+    if (connected > 0 && !all_connected && !timed_out) {
+        LOG_INF("relay: %d/%d peripherals connected, waiting for rest "
+                "(%lld s until timeout)",
+                connected, ZMK_SPLIT_BLE_PERIPHERAL_COUNT,
+                (RELAY_ALL_CONNECT_TIMEOUT_MS -
+                 (k_uptime_get() - first_conn_seen_at)) / 1000);
+        k_work_schedule_for_queue(&relay_work_q, &periodic_work,
+                                  K_MSEC(RELAY_FAST_MS));
+        return;
+    }
+
+    /* Step 3: Try discovery on undiscovered relays (one at a time to
+     * minimize radio contention). */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
         if (relays[i].conn == NULL) {
             continue;
         }
-        connected++;
-        if (relays[i].bat_ready) {
-            ready++;
-        } else if (try_discovery_step(&relays[i])) {
+        if (!relays[i].bat_ready && try_discovery_step(&relays[i])) {
             LOG_INF("relay: started discovery on slot %d", i);
+            break; /* one discovery at a time */
         }
     }
-    /* Stay on fast timer until ALL expected peripherals are connected
-     * and discovered.  This ensures late-connecting peripherals are
-     * picked up quickly rather than waiting for the slow 30 s cycle. */
-    bool all_ready = (connected >= ZMK_SPLIT_BLE_PERIPHERAL_COUNT) &&
-                     (ready == connected);
+
+    bool all_ready = all_connected && (ready == connected);
 
     /* Log relay state for diagnostics */
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -373,7 +432,7 @@ static void periodic_handler(struct k_work *work) {
         }
     }
 
-    /* Step 3: Write cached state to all discovered relays */
+    /* Step 4: Write cached state to all discovered relays */
     for (int r = 0; r < ARRAY_SIZE(relays); r++) {
         struct peripheral_relay *relay = &relays[r];
 
@@ -457,10 +516,10 @@ static int relay_central_init(void) {
                        K_PRIO_PREEMPT(10), /* low priority — never starve ZMK */
                        NULL);
 
-    /* First periodic cycle at 15 s — gives ZMK's split stack time to
-     * establish connections before we attempt GATT discovery.  If discovery
-     * fails (peripheral not ready), it retries every 5 s until all relays
-     * are discovered, then switches to 30 s for periodic battery refresh. */
+    /* First periodic cycle starts quickly just to scan for connections.
+     * GATT operations are deferred until all peripherals are connected
+     * (or timeout), then per-connection settle time ensures ZMK has
+     * finished its own GATT setup before we start ours. */
     k_work_schedule_for_queue(&relay_work_q, &periodic_work,
                               K_MSEC(RELAY_INITIAL_DELAY_MS));
     return 0;
