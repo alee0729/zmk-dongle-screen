@@ -21,6 +21,7 @@
 #include <zephyr/logging/log.h>
 
 #include <zmk/event_manager.h>
+#include <zmk/events/layer_state_changed.h>
 
 #include "battery_relay_central.h"
 
@@ -50,6 +51,11 @@ ZMK_EVENT_IMPL(zmk_peripheral_battery_state_changed);
  * ---------------------------------------------------------------------- */
 
 static uint8_t relay_cache[CONFIG_DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT];
+static uint8_t relayed_layer;
+
+uint8_t battery_relay_get_layer(void) {
+    return relayed_layer;
+}
 
 /* -------------------------------------------------------------------------
  * GATT write handler
@@ -66,6 +72,7 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
     }
 
     const struct battery_relay_data *data = buf;
+    LOG_INF("relay_periph: write received source=%u level=%u", data->source, data->level);
 
     /* Ignore the dongle's own battery (no slot for it on peripheral display) */
     if (data->source == BATTERY_RELAY_SOURCE_DONGLE) {
@@ -74,10 +81,19 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
 
     /* Layer data is multiplexed through this characteristic.
      * source=0xFE means level contains the active layer index.
-     * Currently accepted silently — layer display on peripherals is
-     * driven by local keymap state via the layer_status widget. */
+     * Store it and raise zmk_layer_state_changed so the layer_status
+     * widget redraws with the relayed value. */
     if (data->source == BATTERY_RELAY_SOURCE_LAYER) {
-        LOG_DBG("relay: received layer=%u", data->level);
+        if (data->level != relayed_layer) {
+            relayed_layer = data->level;
+            LOG_DBG("relay: layer=%u", relayed_layer);
+            ZMK_EVENT_RAISE(new_zmk_layer_state_changed(
+                (struct zmk_layer_state_changed){
+                    .layer = relayed_layer,
+                    .state = true,
+                    .timestamp = k_uptime_get(),
+                }));
+        }
         return len;
     }
 

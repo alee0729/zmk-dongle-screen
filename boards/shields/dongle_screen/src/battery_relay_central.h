@@ -49,3 +49,9 @@ struct battery_relay_data {
     uint8_t source;
     uint8_t level;
 } __packed;
+
+#if IS_ENABLED(CONFIG_DONGLE_SCREEN_BATTERY_RELAY) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+/** Return the last layer index relayed from the central (dongle).
+ *  Only available on peripheral builds with battery relay enabled. */
+uint8_t battery_relay_get_layer(void);
+#endif
