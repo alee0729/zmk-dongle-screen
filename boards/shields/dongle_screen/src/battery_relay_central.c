@@ -71,6 +71,7 @@ struct peripheral_relay {
     struct bt_gatt_discover_params discover_params;
     struct bt_uuid_128 discover_uuid; /* copy kept alive for async discovery */
     struct k_work_delayable discovery_work;
+    uint8_t discover_retries;        /* remaining retries on transient errors */
 
     /* Spaced write state for push_cached_state */
     struct k_work_delayable push_work;
@@ -84,6 +85,12 @@ struct peripheral_relay {
  * updates, HID re-subscription).  10 s gives ZMK plenty of headroom. */
 #define RELAY_DISCOVERY_DELAY_MS 10000
 
+/* Extra delay added per relay-slot index so that peripherals that
+ * connect at nearly the same time don't start GATT discovery
+ * simultaneously.  Prevents ATT buffer contention between the two
+ * discovery sessions. */
+#define RELAY_DISCOVERY_STAGGER_MS 3000
+
 /* Delay between discovery phases and before pushing cached state.
  * Keeps the ATT channel free for ZMK's split operations. */
 #define RELAY_INTER_PHASE_DELAY_MS 2000
@@ -91,6 +98,10 @@ struct peripheral_relay {
 /* Delay between individual GATT writes when pushing cached state.
  * Prevents BLE TX buffer exhaustion that starves ZMK's split traffic. */
 #define RELAY_WRITE_SPACING_MS 50
+
+/* How many times to retry bt_gatt_discover on transient errors
+ * (e.g. -EBUSY, -ENOMEM). */
+#define RELAY_DISCOVERY_MAX_RETRIES 5
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -113,6 +124,10 @@ static struct peripheral_relay *get_free_relay(void) {
         }
     }
     return NULL;
+}
+
+static int get_relay_index(const struct peripheral_relay *relay) {
+    return (int)(relay - relays);
 }
 
 /* -------------------------------------------------------------------------
@@ -261,7 +276,13 @@ static void start_battery_discovery(struct peripheral_relay *relay) {
 
     int err = bt_gatt_discover(relay->conn, &relay->discover_params);
     if (err) {
-        LOG_ERR("battery_relay: bt_gatt_discover failed: %d", err);
+        LOG_ERR("battery_relay: bt_gatt_discover failed: %d (retries left %u)",
+                err, relay->discover_retries);
+        /* Retry on transient errors (-EBUSY, -ENOMEM, -EAGAIN) */
+        if (relay->discover_retries > 0 && (err == -EBUSY || err == -ENOMEM || err == -EAGAIN)) {
+            relay->discover_retries--;
+            k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_INTER_PHASE_DELAY_MS));
+        }
     }
 }
 
@@ -304,9 +325,15 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
         return;
     }
 
-    /* Only handle LE connections (split peripherals are always LE) */
+    /* Only handle LE connections where we are the central (i.e.
+     * connections we initiated to split peripherals).  Skip host BLE
+     * connections (where we are the peripheral) to avoid wasting relay
+     * slots and sending spurious GATT discovery to the host. */
     struct bt_conn_info info;
     if (bt_conn_get_info(conn, &info) < 0 || info.type != BT_CONN_TYPE_LE) {
+        return;
+    }
+    if (info.role != BT_CONN_ROLE_CENTRAL) {
         return;
     }
 
@@ -321,10 +348,19 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
     relay->push_index = 0;
+    relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
 
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
     k_work_init_delayable(&relay->push_work, push_work_handler);
-    k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_DELAY_MS));
+
+    /* Stagger discovery start per relay index so that peripherals
+     * connecting at the same time don't start concurrent GATT
+     * discoveries that compete for ATT buffers. */
+    uint32_t delay = RELAY_DISCOVERY_DELAY_MS +
+                     (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
+    LOG_DBG("battery_relay: scheduling discovery in %u ms (slot %d)",
+            delay, get_relay_index(relay));
+    k_work_schedule(&relay->discovery_work, K_MSEC(delay));
 }
 
 static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
