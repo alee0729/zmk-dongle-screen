@@ -28,7 +28,6 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/logging/log.h>
 
-#include <zmk/split/central.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
 #include <zmk/event_manager.h>
@@ -44,7 +43,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * periodically re-broadcast for resilience.
  * ---------------------------------------------------------------------- */
 
-static uint8_t battery_cache[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static uint8_t layer_cache;
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
@@ -92,7 +91,7 @@ struct peripheral_relay {
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
 
-static struct peripheral_relay relays[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
