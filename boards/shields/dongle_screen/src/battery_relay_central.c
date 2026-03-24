@@ -91,6 +91,11 @@ struct peripheral_relay {
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
 
+/* Delay between individual BLE writes when sending multiple relay packets.
+ * Gives the BLE scheduler time to process HID traffic between relay writes,
+ * preventing relay bursts from starving keypress notifications. */
+#define RELAY_WRITE_STAGGER_MS 50
+
 static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 static struct peripheral_relay *get_relay_by_conn(struct bt_conn *conn) {
@@ -157,23 +162,92 @@ static void broadcast_layer(uint8_t layer) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Staggered write queue
+ *
+ * Instead of sending multiple BLE writes back-to-back (which floods the
+ * Link Layer TX buffer and starves HID traffic), we queue relay packets
+ * and send one per RELAY_WRITE_STAGGER_MS.  This leaves connection events
+ * free for keypress HID notifications between relay writes.
+ * ---------------------------------------------------------------------- */
+
+struct relay_write_item {
+    uint8_t relay_idx;   /* index into relays[], or 0xFF for broadcast */
+    uint8_t source;
+    uint8_t level;
+};
+
+#define RELAY_WRITE_QUEUE_SIZE 16
+K_MSGQ_DEFINE(relay_write_msgq, sizeof(struct relay_write_item), RELAY_WRITE_QUEUE_SIZE, 1);
+
+static void staggered_write_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(staggered_write_work, staggered_write_handler);
+
+static void staggered_write_handler(struct k_work *work) {
+    struct relay_write_item item;
+
+    if (k_msgq_get(&relay_write_msgq, &item, K_NO_WAIT) != 0) {
+        return; /* queue empty */
+    }
+
+    if (item.relay_idx == 0xFF) {
+        /* Broadcast to all peripherals */
+        if (item.source == BATTERY_RELAY_SOURCE_LAYER) {
+            for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+                write_layer_to_relay(&relays[i], item.level);
+            }
+        } else {
+            for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+                write_battery_to_relay(&relays[i], item.source, item.level);
+            }
+        }
+    } else if (item.relay_idx < ARRAY_SIZE(relays)) {
+        if (item.source == BATTERY_RELAY_SOURCE_LAYER) {
+            write_layer_to_relay(&relays[item.relay_idx], item.level);
+        } else {
+            write_battery_to_relay(&relays[item.relay_idx], item.source, item.level);
+        }
+    }
+
+    /* If more items remain, schedule next write after stagger delay */
+    if (k_msgq_num_used_get(&relay_write_msgq) > 0) {
+        k_work_schedule(&staggered_write_work, K_MSEC(RELAY_WRITE_STAGGER_MS));
+    }
+}
+
+static void queue_relay_write(uint8_t relay_idx, uint8_t source, uint8_t level) {
+    struct relay_write_item item = {
+        .relay_idx = relay_idx,
+        .source = source,
+        .level = level,
+    };
+    if (k_msgq_put(&relay_write_msgq, &item, K_NO_WAIT) != 0) {
+        LOG_WRN("relay: staggered write queue full, dropping packet");
+        return;
+    }
+    /* Kick the staggered writer if not already scheduled */
+    k_work_schedule(&staggered_write_work, K_NO_WAIT);
+}
+
 /** Push all cached state to a single peripheral after discovery completes. */
 static void push_cached_state(struct peripheral_relay *relay) {
-    /* Push all cached battery levels */
+    uint8_t idx = (uint8_t)get_relay_index(relay);
+
+    /* Push all cached battery levels (staggered) */
     for (int i = 0; i < ARRAY_SIZE(battery_cache); i++) {
         if (battery_cache[i] > 0) {
-            write_battery_to_relay(relay, (uint8_t)i, battery_cache[i]);
+            queue_relay_write(idx, (uint8_t)i, battery_cache[i]);
         }
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     if (dongle_battery_cache > 0) {
-        write_battery_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+        queue_relay_write(idx, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
     }
 #endif
 
     /* Push current layer */
-    write_layer_to_relay(relay, layer_cache);
+    queue_relay_write(idx, BATTERY_RELAY_SOURCE_LAYER, layer_cache);
 }
 
 /* -------------------------------------------------------------------------
@@ -264,21 +338,23 @@ static void periodic_broadcast_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(periodic_broadcast_work, periodic_broadcast_handler);
 
 static void periodic_broadcast_handler(struct k_work *work) {
+    /* Queue all cached state as staggered broadcast writes (relay_idx=0xFF).
+     * This avoids flooding the BLE connection with back-to-back writes. */
     for (int src = 0; src < ARRAY_SIZE(battery_cache); src++) {
         if (battery_cache[src] > 0) {
-            broadcast_battery((uint8_t)src, battery_cache[src]);
+            queue_relay_write(0xFF, (uint8_t)src, battery_cache[src]);
         }
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     if (dongle_battery_cache > 0) {
-        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+        queue_relay_write(0xFF, BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
     }
 #endif
 
     /* Rebroadcast layer — BLE write-without-response can drop packets,
      * so periodic resend ensures peripherals stay in sync. */
-    broadcast_layer(layer_cache);
+    queue_relay_write(0xFF, BATTERY_RELAY_SOURCE_LAYER, layer_cache);
 
     /* Reschedule */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
