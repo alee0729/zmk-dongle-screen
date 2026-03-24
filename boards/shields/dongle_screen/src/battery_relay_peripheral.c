@@ -58,7 +58,7 @@ uint8_t battery_relay_get_layer(void) {
 }
 
 /* -------------------------------------------------------------------------
- * GATT write handler
+ * GATT write handler — raises events directly
  * ---------------------------------------------------------------------- */
 
 static ssize_t battery_relay_write_cb(struct bt_conn *conn,
@@ -85,7 +85,7 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
      * widget redraws with the relayed value. */
     if (data->source == BATTERY_RELAY_SOURCE_LAYER) {
         relayed_layer = data->level;
-        LOG_DBG("relay: layer=%u", relayed_layer);
+        LOG_INF("relay_periph: layer=%u", relayed_layer);
         ZMK_EVENT_RAISE(new_zmk_layer_state_changed(
             (struct zmk_layer_state_changed){
                 .layer = relayed_layer,
@@ -102,8 +102,7 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
     }
 
     relay_cache[data->source] = data->level;
-
-    LOG_DBG("battery_relay: source=%u level=%u%%", data->source, data->level);
+    LOG_INF("relay_periph: source=%u battery=%u%%", data->source, data->level);
 
     /*
      * Re-raise as zmk_peripheral_battery_state_changed so the battery_status
