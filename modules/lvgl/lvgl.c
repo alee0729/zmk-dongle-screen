@@ -269,4 +269,4 @@ static int lvgl_init(void)
 	return 0;
 }
 
-SYS_INIT(lvgl_init, APPLICATION);
+SYS_INIT(lvgl_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
