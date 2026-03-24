@@ -1,4 +1,5 @@
 #include <zephyr/kernel.h>
+#include <zephyr/init.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/display.h>
 #include <zephyr/logging/log.h>
