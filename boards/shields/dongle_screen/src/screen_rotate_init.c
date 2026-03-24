@@ -35,4 +35,4 @@ int disp_set_orientation(void)
 	return 0;
 }
 
-SYS_INIT(disp_set_orientation, APPLICATION);
+SYS_INIT(disp_set_orientation, APPLICATION, 60);
