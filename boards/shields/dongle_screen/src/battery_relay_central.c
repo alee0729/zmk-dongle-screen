@@ -381,6 +381,8 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     const struct zmk_layer_state_changed *layer_ev = as_zmk_layer_state_changed(eh);
     if (layer_ev) {
         uint8_t highest = zmk_keymap_highest_layer_active();
+        LOG_INF("relay_central: layer event layer=%u state=%u, highest=%u",
+                layer_ev->layer, layer_ev->state, highest);
         layer_cache = highest;
         broadcast_layer(highest);
         return ZMK_EV_EVENT_BUBBLE;
