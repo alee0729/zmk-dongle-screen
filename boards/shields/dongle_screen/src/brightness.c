@@ -677,4 +677,4 @@ static int init_fixed_brightness(void)
     return 0;
 }
 
-SYS_INIT(init_fixed_brightness, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+SYS_INIT(init_fixed_brightness, APPLICATION);
