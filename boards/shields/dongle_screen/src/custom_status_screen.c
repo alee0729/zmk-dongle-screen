@@ -48,11 +48,12 @@ static lv_obj_t *diag_label;
 
 static void diag_timer_cb(lv_timer_t *timer) {
     static char buf[80];
-    snprintf(buf, sizeof(buf), "C:%u D:%u/%u/%u\nW:%u E:%u",
+    snprintf(buf, sizeof(buf), "C:%u D:%u/%u/%u/%u\nW:%u E:%u",
              (unsigned)relay_diag_conn_count,
              (unsigned)relay_diag_disc_start,
              (unsigned)relay_diag_disc_ok,
              (unsigned)relay_diag_disc_fail,
+             (unsigned)relay_diag_disc_err,
              (unsigned)relay_diag_write_ok,
              (unsigned)relay_diag_write_err);
     lv_label_set_text(diag_label, buf);
