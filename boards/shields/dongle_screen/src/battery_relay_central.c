@@ -294,13 +294,16 @@ static void watchdog_work_handler(struct k_work *work) {
     if (relay->conn == NULL || relay->bat_ready) {
         return;
     }
-    /* Discovery callback never fired — retry */
-    LOG_WRN("battery_relay: watchdog fired, discovery callback never came");
+    /* Discovery callback never fired — retry if retries remain */
+    LOG_WRN("battery_relay: watchdog fired, discovery callback never came (retries %u)",
+            relay->discover_retries);
     relay->discovery_in_progress = false;
     if (relay->discover_retries > 0) {
         relay->discover_retries--;
+        k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+    } else {
+        LOG_ERR("battery_relay: giving up after watchdog exhausted retries");
     }
-    k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
 }
 
 /* -------------------------------------------------------------------------
