@@ -19,6 +19,11 @@
  *   7. Periodically re-broadcasts battery state for resilience against
  *      dropped BLE writes.
  *
+ * IMPORTANT: All bt_gatt_write_without_response calls are serialized through
+ * a dedicated writer thread.  This function can block waiting for BT TX
+ * buffers — if called directly from the system work queue, it deadlocks
+ * because the BT stack needs the system work queue for TX completion.
+ *
  * This allows peripherals with displays (e.g. nice_view_gem) to show battery
  * levels for all keyboard splits and the current active layer.
  */
@@ -130,21 +135,71 @@ static int get_relay_index(const struct peripheral_relay *relay) {
 }
 
 /* -------------------------------------------------------------------------
- * Write helpers
+ * Serialized write queue
+ *
+ * bt_gatt_write_without_response can block waiting for BT TX buffers.
+ * If called from the system work queue, this deadlocks because the BT
+ * stack needs the system work queue for TX completion callbacks.
+ *
+ * Solution: a message queue + dedicated writer thread.  Callers enqueue
+ * write requests (non-blocking), and the writer thread sends them one
+ * at a time.  Blocking on TX buffers is safe here because it doesn't
+ * hold up the system work queue.
+ * ---------------------------------------------------------------------- */
+
+struct relay_write_msg {
+    uint8_t relay_idx;    /* index into relays[] */
+    struct battery_relay_data data;
+};
+
+#define RELAY_WRITE_QUEUE_SIZE 16
+K_MSGQ_DEFINE(relay_write_msgq, sizeof(struct relay_write_msg), RELAY_WRITE_QUEUE_SIZE, 4);
+
+#define RELAY_WRITER_STACK_SIZE 1024
+#define RELAY_WRITER_PRIORITY   K_PRIO_PREEMPT(8)
+
+K_THREAD_STACK_DEFINE(relay_writer_stack, RELAY_WRITER_STACK_SIZE);
+static struct k_thread relay_writer_thread;
+
+static void relay_writer_func(void *p1, void *p2, void *p3) {
+    struct relay_write_msg msg;
+
+    while (true) {
+        /* Block until a write request is available */
+        k_msgq_get(&relay_write_msgq, &msg, K_FOREVER);
+
+        struct peripheral_relay *relay = &relays[msg.relay_idx];
+        if (relay->conn == NULL) {
+            continue;
+        }
+
+        /* This call may block waiting for TX buffers — that's OK
+         * because we're on a dedicated thread, not the system work queue. */
+        int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
+                                                  &msg.data, sizeof(msg.data), false);
+        if (err) {
+            relay_diag_write_err++;
+            LOG_WRN("relay_writer: write failed: %d (relay %u)", err, msg.relay_idx);
+        } else {
+            relay_diag_write_ok++;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Write helpers — enqueue to writer thread instead of writing directly
  * ---------------------------------------------------------------------- */
 
 static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
     if (!relay->bat_ready || relay->conn == NULL) {
         return;
     }
-    struct battery_relay_data data = { .source = source, .level = level };
-    int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
-                                             &data, sizeof(data), false);
-    if (err) {
-        relay_diag_write_err++;
-        LOG_WRN("battery_relay: write failed: %d", err);
-    } else {
-        relay_diag_write_ok++;
+    struct relay_write_msg msg = {
+        .relay_idx = (uint8_t)get_relay_index(relay),
+        .data = { .source = source, .level = level },
+    };
+    if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
+        LOG_WRN("relay: write queue full, dropping write (source=%u)", source);
     }
 }
 
@@ -152,16 +207,12 @@ static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) 
     if (!relay->layer_ready || relay->conn == NULL) {
         return;
     }
-    /* Layer data is multiplexed through the battery relay characteristic
-     * using source=BATTERY_RELAY_SOURCE_LAYER, level=layer_index. */
-    struct battery_relay_data data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer };
-    int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
-                                             &data, sizeof(data), false);
-    if (err) {
-        relay_diag_write_err++;
-        LOG_WRN("layer_relay: write failed: %d", err);
-    } else {
-        relay_diag_write_ok++;
+    struct relay_write_msg msg = {
+        .relay_idx = (uint8_t)get_relay_index(relay),
+        .data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer },
+    };
+    if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
+        LOG_WRN("relay: write queue full, dropping layer write");
     }
 }
 
@@ -453,3 +504,17 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
 #endif
 
+/* -------------------------------------------------------------------------
+ * Writer thread initialization
+ * ---------------------------------------------------------------------- */
+
+static int relay_writer_init(void) {
+    k_thread_create(&relay_writer_thread, relay_writer_stack,
+                    K_THREAD_STACK_SIZEOF(relay_writer_stack),
+                    relay_writer_func, NULL, NULL, NULL,
+                    RELAY_WRITER_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&relay_writer_thread, "relay_writer");
+    return 0;
+}
+
+SYS_INIT(relay_writer_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
