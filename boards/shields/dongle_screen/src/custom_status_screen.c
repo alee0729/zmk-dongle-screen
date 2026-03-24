@@ -34,6 +34,31 @@ static struct zmk_widget_mod_status mod_widget;
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+/* Diagnostic counters from battery_relay_central.c */
+#if IS_ENABLED(CONFIG_DONGLE_SCREEN_BATTERY_RELAY) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+extern volatile uint32_t relay_diag_conn_count;
+extern volatile uint32_t relay_diag_disc_start;
+extern volatile uint32_t relay_diag_disc_ok;
+extern volatile uint32_t relay_diag_disc_fail;
+extern volatile uint32_t relay_diag_disc_err;
+extern volatile uint32_t relay_diag_write_ok;
+extern volatile uint32_t relay_diag_write_err;
+
+static lv_obj_t *diag_label;
+
+static void diag_timer_cb(lv_timer_t *timer) {
+    static char buf[80];
+    snprintf(buf, sizeof(buf), "C:%u D:%u/%u/%u\nW:%u E:%u",
+             (unsigned)relay_diag_conn_count,
+             (unsigned)relay_diag_disc_start,
+             (unsigned)relay_diag_disc_ok,
+             (unsigned)relay_diag_disc_fail,
+             (unsigned)relay_diag_write_ok,
+             (unsigned)relay_diag_write_err);
+    lv_label_set_text(diag_label, buf);
+}
+#endif
+
 lv_style_t global_style;
 
 lv_obj_t *zmk_display_status_screen()
@@ -74,6 +99,13 @@ lv_obj_t *zmk_display_status_screen()
 #if CONFIG_DONGLE_SCREEN_MODIFIER_ACTIVE
     zmk_widget_mod_status_init(&mod_widget, screen);
     lv_obj_align(zmk_widget_mod_status_obj(&mod_widget), LV_ALIGN_CENTER, 0, 35);
+#endif
+
+#if IS_ENABLED(CONFIG_DONGLE_SCREEN_BATTERY_RELAY) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+    diag_label = lv_label_create(screen);
+    lv_label_set_text(diag_label, "relay...");
+    lv_obj_align(diag_label, LV_ALIGN_BOTTOM_LEFT, 2, -2);
+    lv_timer_create(diag_timer_cb, 1000, NULL);
 #endif
 
     return screen;

@@ -46,6 +46,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static uint8_t layer_cache;
 
+/* Diagnostic counters — read from dongle display for debugging */
+volatile uint32_t relay_diag_conn_count;      /* relay_connected calls */
+volatile uint32_t relay_diag_disc_start;      /* discovery attempts */
+volatile uint32_t relay_diag_disc_ok;         /* discovery successes */
+volatile uint32_t relay_diag_disc_fail;       /* discovery not-found */
+volatile uint32_t relay_diag_disc_err;        /* bt_gatt_discover errors */
+volatile uint32_t relay_diag_write_ok;        /* successful writes */
+volatile uint32_t relay_diag_write_err;       /* failed writes */
+
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
 static uint8_t dongle_battery_cache;
 #endif
@@ -127,7 +136,10 @@ static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t sourc
     int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
                                              &data, sizeof(data), false);
     if (err) {
+        relay_diag_write_err++;
         LOG_WRN("battery_relay: write failed: %d", err);
+    } else {
+        relay_diag_write_ok++;
     }
 }
 
@@ -141,7 +153,10 @@ static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) 
     int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
                                              &data, sizeof(data), false);
     if (err) {
+        relay_diag_write_err++;
         LOG_WRN("layer_relay: write failed: %d", err);
+    } else {
+        relay_diag_write_ok++;
     }
 }
 
@@ -190,6 +205,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
 
     if (!attr) {
         if (!relay->bat_ready) {
+            relay_diag_disc_fail++;
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
             /* Retry with delay if retries remain, otherwise give up */
             if (relay->discover_retries > 0) {
@@ -206,6 +222,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
         return BT_GATT_ITER_STOP;
     }
 
+    relay_diag_disc_ok++;
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready = true;
@@ -218,6 +235,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
 }
 
 static void start_battery_discovery(struct peripheral_relay *relay) {
+    relay_diag_disc_start++;
     memcpy(&relay->discover_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
 
     relay->discover_params.uuid = &relay->discover_uuid.uuid;
@@ -228,6 +246,7 @@ static void start_battery_discovery(struct peripheral_relay *relay) {
 
     int err = bt_gatt_discover(relay->conn, &relay->discover_params);
     if (err) {
+        relay_diag_disc_err++;
         LOG_ERR("battery_relay: bt_gatt_discover failed: %d (retries left %u)",
                 err, relay->discover_retries);
         /* Retry on transient errors */
@@ -303,6 +322,8 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     if (info.role != BT_CONN_ROLE_CENTRAL) {
         return;
     }
+
+    relay_diag_conn_count++;
 
     struct peripheral_relay *relay = get_free_relay();
     if (!relay) {
