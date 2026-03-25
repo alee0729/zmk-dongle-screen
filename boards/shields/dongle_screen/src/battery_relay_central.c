@@ -7,18 +7,20 @@
  * ======================================
  * When enabled, the central:
  *   1. Registers BT connection callbacks.
- *   2. On peripheral connect, discovers the battery relay GATT characteristic
- *      (layer data is multiplexed through it).
- *   3. Subscribes to ZMK battery and layer events.
+ *   2. On peripheral connect, discovers the battery relay GATT characteristic.
+ *   3. Subscribes to ZMK battery events.
  *   4. On every battery change, writes struct battery_relay_data to each
  *      connected peripheral that has been successfully discovered.
- *   5. On every layer change, debounces for LAYER_DEBOUNCE_MS and then
- *      writes the settled layer index to each connected peripheral via the
- *      battery relay characteristic.
- *   6. Caches battery levels and layer index so newly-discovered peripherals
- *      get the current state immediately after GATT discovery completes.
- *   7. Periodically re-broadcasts battery state for resilience against
+ *   5. Caches battery levels so newly-discovered peripherals get the current
+ *      state immediately after GATT discovery completes.
+ *   6. Periodically re-broadcasts battery state for resilience against
  *      dropped BLE writes.
+ *
+ * NOTE: Layer relay is currently disabled. Layer changes only occur during
+ * active typing (hold-tap keys), which competes with keyboard HID split
+ * protocol for BLE TX bandwidth and causes keystroke drops. Battery levels
+ * change slowly (~minutes) and effectively always during idle, so battery
+ * relay alone does not cause contention.
  *
  * IMPORTANT: All bt_gatt_write_without_response calls are serialized through
  * a dedicated writer thread.  This function can block waiting for BT TX
@@ -26,7 +28,7 @@
  * because the BT stack needs the system work queue for TX completion.
  *
  * This allows peripherals with displays (e.g. nice_view_gem) to show battery
- * levels for all keyboard splits and the current active layer.
+ * levels for all keyboard splits.
  */
 
 #include <zephyr/kernel.h>
@@ -36,10 +38,10 @@
 #include <zephyr/logging/log.h>
 
 #include <zmk/events/battery_state_changed.h>
-#include <zmk/events/layer_state_changed.h>
+/* Layer relay disabled: #include <zmk/events/layer_state_changed.h> */
 #include <zmk/event_manager.h>
 #include <zmk/battery.h>
-#include <zmk/keymap.h>
+/* Layer relay disabled: #include <zmk/keymap.h> */
 
 #include "battery_relay_central.h"
 
@@ -51,15 +53,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * ---------------------------------------------------------------------- */
 
 static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
-static uint8_t layer_cache;
+/* Layer relay disabled: static uint8_t layer_cache; */
+/* Layer relay disabled: static uint8_t last_broadcast_layer = 0xFF; */
 
-/* Last layer value actually broadcast to peripherals.
- * Used for deduplication: the debounce handler skips writes when the layer
- * hasn't changed since the previous broadcast (e.g. a momentary layer that
- * fires activate/deactivate but returns to the same base layer). */
-static uint8_t last_broadcast_layer = 0xFF; /* 0xFF → never sent, forces first write */
-
-/* Diagnostic counters — read from dongle display for debugging */
+/* Diagnostic counters — available for debugging */
 volatile uint32_t relay_diag_conn_count;      /* relay_connected calls */
 volatile uint32_t relay_diag_disc_start;      /* discovery attempts */
 volatile uint32_t relay_diag_disc_ok;         /* discovery successes */
@@ -79,13 +76,11 @@ static uint8_t dongle_battery_cache;
 struct peripheral_relay {
     struct bt_conn *conn;
 
-    /* Battery relay GATT characteristic (also used for layer data) */
+    /* Battery relay GATT characteristic */
     uint16_t bat_char_handle;
     bool bat_ready;
 
-    /* Layer relay — multiplexed through the battery relay characteristic.
-     * layer_ready is set after discovery completes so layer writes can begin. */
-    bool layer_ready;
+    /* Layer relay disabled: bool layer_ready; */
 
     /* Discovery state */
     struct bt_gatt_discover_params discover_params;
@@ -99,7 +94,7 @@ struct peripheral_relay {
 /* Delay before starting GATT discovery after connection.
  * ZMK's split stack also does GATT discovery on connect;
  * starting a concurrent discovery causes -EBUSY.
- * 2000 ms gives ZMK time to complete its own setup first. */
+ * 5000 ms gives ZMK time to complete its own setup first. */
 #define RELAY_DISCOVERY_DELAY_MS 5000
 
 /* Extra stagger per relay-slot index so peripherals that connect
@@ -211,18 +206,26 @@ static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t sourc
     }
 }
 
-static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) {
-    if (!relay->layer_ready || relay->conn == NULL) {
-        return;
-    }
-    struct relay_write_msg msg = {
-        .relay_idx = (uint8_t)get_relay_index(relay),
-        .data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer },
-    };
-    if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
-        LOG_WRN("relay: write queue full, dropping layer write");
-    }
-}
+/*
+ * Layer relay disabled:
+ *
+ * static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) {
+ *     if (!relay->layer_ready || relay->conn == NULL) { return; }
+ *     struct relay_write_msg msg = {
+ *         .relay_idx = (uint8_t)get_relay_index(relay),
+ *         .data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer },
+ *     };
+ *     if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
+ *         LOG_WRN("relay: write queue full, dropping layer write");
+ *     }
+ * }
+ *
+ * static void broadcast_layer(uint8_t layer) {
+ *     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
+ *         write_layer_to_relay(&relays[i], layer);
+ *     }
+ * }
+ */
 
 static void broadcast_battery(uint8_t source, uint8_t level) {
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -230,38 +233,19 @@ static void broadcast_battery(uint8_t source, uint8_t level) {
     }
 }
 
-static void broadcast_layer(uint8_t layer) {
-    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        write_layer_to_relay(&relays[i], layer);
-    }
-}
-
-/* -------------------------------------------------------------------------
- * Layer change debounce
+/*
+ * Layer debounce disabled:
  *
- * Hold-tap layer keys generate rapid zmk_layer_state_changed events
- * (activate/deactivate pairs on every key evaluation).  Sending a
- * GATT write on every event floods the ATT bearer write queue.
- *
- * k_work_reschedule resets the deadline on each new event so that
- * bursts within LAYER_DEBOUNCE_MS are collapsed into a single write
- * reflecting the settled layer value.
- * ---------------------------------------------------------------------- */
-#define LAYER_DEBOUNCE_MS 50
-
-static void layer_debounce_work_fn(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(layer_debounce_work, layer_debounce_work_fn);
-
-static void layer_debounce_work_fn(struct k_work *work) {
-    if (layer_cache == last_broadcast_layer) {
-        /* Layer settled back to the previously-sent value (e.g. a momentary
-         * layer hold that returned to base).  No write needed. */
-        return;
-    }
-    last_broadcast_layer = layer_cache;
-    broadcast_layer(layer_cache);
-    LOG_DBG("relay: layer broadcast settled at %u", layer_cache);
-}
+ * #define LAYER_DEBOUNCE_MS 50
+ * static void layer_debounce_work_fn(struct k_work *work);
+ * K_WORK_DELAYABLE_DEFINE(layer_debounce_work, layer_debounce_work_fn);
+ * static void layer_debounce_work_fn(struct k_work *work) {
+ *     if (layer_cache == last_broadcast_layer) { return; }
+ *     last_broadcast_layer = layer_cache;
+ *     broadcast_layer(layer_cache);
+ *     LOG_DBG("relay: layer broadcast settled at %u", layer_cache);
+ * }
+ */
 
 /** Push all cached state to a single peripheral after discovery completes. */
 static void push_cached_state(struct peripheral_relay *relay) {
@@ -278,16 +262,11 @@ static void push_cached_state(struct peripheral_relay *relay) {
     }
 #endif
 
-    /* Push current layer */
-    write_layer_to_relay(relay, layer_cache);
+    /* Layer relay disabled: write_layer_to_relay(relay, layer_cache); */
 }
 
 /* -------------------------------------------------------------------------
  * GATT discovery — battery characteristic only
- *
- * Layer data is multiplexed through the battery relay characteristic,
- * so no separate layer discovery is needed.  After battery discovery
- * completes we mark layer_ready and push cached state.
  * ---------------------------------------------------------------------- */
 
 static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -309,7 +288,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
                 LOG_ERR("battery_relay: giving up discovery on conn %p", (void *)conn);
             }
         } else {
-            /* Discovery succeeded — proceed to mark layer_ready */
+            /* Discovery succeeded — schedule push via work queue */
             k_work_schedule(&relay->discovery_work, K_NO_WAIT);
         }
         return BT_GATT_ITER_STOP;
@@ -366,10 +345,9 @@ static void discovery_work_handler(struct k_work *work) {
     }
     if (!relay->bat_ready) {
         start_battery_discovery(relay);
-    } else if (!relay->layer_ready) {
-        /* Layer is multiplexed through the battery characteristic,
-         * so no separate discovery needed — just mark ready. */
-        relay->layer_ready = true;
+    } else {
+        /* Battery discovery done — push cached state to peripheral.
+         * Layer relay disabled: previously set layer_ready here. */
         push_cached_state(relay);
     }
 }
@@ -412,11 +390,10 @@ static void periodic_broadcast_handler(struct k_work *work) {
     }
 #endif
 
-    /* Rebroadcast layer — BLE write-without-response can drop packets,
-     * so periodic resend ensures peripherals stay in sync.
-     * Bypass the debounce/deduplication path so the value always goes out. */
-    broadcast_layer(layer_cache);
-    last_broadcast_layer = layer_cache; /* keep dedup state in sync */
+    /* Layer relay disabled:
+     * broadcast_layer(layer_cache);
+     * last_broadcast_layer = layer_cache;
+     */
 
     /* Reschedule */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
@@ -453,7 +430,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->conn = bt_conn_ref(conn);
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
-    relay->layer_ready = false;
+    /* Layer relay disabled: relay->layer_ready = false; */
     relay->discovery_in_progress = false;
     relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
 
@@ -486,13 +463,10 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
     relay->conn = NULL;
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
-    relay->layer_ready = false;
+    /* Layer relay disabled: relay->layer_ready = false; */
     relay->discovery_in_progress = false;
 
-    /* Reset last_broadcast_layer so the reconnecting peripheral gets a fresh
-     * layer push via push_cached_state after discovery, even if the layer
-     * hasn't changed on the dongle side. */
-    last_broadcast_layer = 0xFF;
+    /* Layer relay disabled: last_broadcast_layer = 0xFF; */
 }
 
 BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
@@ -501,7 +475,7 @@ BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
 };
 
 /* -------------------------------------------------------------------------
- * ZMK event listener — battery + layer changes
+ * ZMK event listener — battery changes only (layer relay disabled)
  * ---------------------------------------------------------------------- */
 
 static int relay_central_event_handler(const zmk_event_t *eh) {
@@ -538,23 +512,24 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     }
 #endif
 
-    const struct zmk_layer_state_changed *layer_ev = as_zmk_layer_state_changed(eh);
-    if (layer_ev) {
-        uint8_t highest = zmk_keymap_highest_layer_active();
-        layer_cache = highest;
-        /* Debounce: hold-tap layer keys fire rapid activate/deactivate pairs.
-         * k_work_reschedule resets the deadline on each new event; the work
-         * handler sends only the settled value, collapsing bursts into one write. */
-        k_work_reschedule(&layer_debounce_work, K_MSEC(LAYER_DEBOUNCE_MS));
-        return ZMK_EV_EVENT_BUBBLE;
-    }
+    /*
+     * Layer relay disabled:
+     *
+     * const struct zmk_layer_state_changed *layer_ev = as_zmk_layer_state_changed(eh);
+     * if (layer_ev) {
+     *     uint8_t highest = zmk_keymap_highest_layer_active();
+     *     layer_cache = highest;
+     *     k_work_reschedule(&layer_debounce_work, K_MSEC(LAYER_DEBOUNCE_MS));
+     *     return ZMK_EV_EVENT_BUBBLE;
+     * }
+     */
 
     return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(battery_relay_central, relay_central_event_handler);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_peripheral_battery_state_changed);
-ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
+/* Layer relay disabled: ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed); */
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
