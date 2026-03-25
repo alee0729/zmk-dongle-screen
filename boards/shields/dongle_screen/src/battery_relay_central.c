@@ -12,8 +12,9 @@
  *   3. Subscribes to ZMK battery and layer events.
  *   4. On every battery change, writes struct battery_relay_data to each
  *      connected peripheral that has been successfully discovered.
- *   5. On every layer change, writes the layer index to each
- *      connected peripheral via the battery relay characteristic.
+ *   5. On every layer change, debounces for LAYER_DEBOUNCE_MS and then
+ *      writes the settled layer index to each connected peripheral via the
+ *      battery relay characteristic.
  *   6. Caches battery levels and layer index so newly-discovered peripherals
  *      get the current state immediately after GATT discovery completes.
  *   7. Periodically re-broadcasts battery state for resilience against
@@ -51,6 +52,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static uint8_t layer_cache;
+
+/* Last layer value actually broadcast to peripherals.
+ * Used for deduplication: the debounce handler skips writes when the layer
+ * hasn't changed since the previous broadcast (e.g. a momentary layer that
+ * fires activate/deactivate but returns to the same base layer). */
+static uint8_t last_broadcast_layer = 0xFF; /* 0xFF → never sent, forces first write */
 
 /* Diagnostic counters — read from dongle display for debugging */
 volatile uint32_t relay_diag_conn_count;      /* relay_connected calls */
@@ -229,6 +236,33 @@ static void broadcast_layer(uint8_t layer) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Layer change debounce
+ *
+ * Hold-tap layer keys generate rapid zmk_layer_state_changed events
+ * (activate/deactivate pairs on every key evaluation).  Sending a
+ * GATT write on every event floods the ATT bearer write queue.
+ *
+ * k_work_reschedule resets the deadline on each new event so that
+ * bursts within LAYER_DEBOUNCE_MS are collapsed into a single write
+ * reflecting the settled layer value.
+ * ---------------------------------------------------------------------- */
+#define LAYER_DEBOUNCE_MS 50
+
+static void layer_debounce_work_fn(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(layer_debounce_work, layer_debounce_work_fn);
+
+static void layer_debounce_work_fn(struct k_work *work) {
+    if (layer_cache == last_broadcast_layer) {
+        /* Layer settled back to the previously-sent value (e.g. a momentary
+         * layer hold that returned to base).  No write needed. */
+        return;
+    }
+    last_broadcast_layer = layer_cache;
+    broadcast_layer(layer_cache);
+    LOG_DBG("relay: layer broadcast settled at %u", layer_cache);
+}
+
 /** Push all cached state to a single peripheral after discovery completes. */
 static void push_cached_state(struct peripheral_relay *relay) {
     /* Push all cached battery levels */
@@ -379,8 +413,10 @@ static void periodic_broadcast_handler(struct k_work *work) {
 #endif
 
     /* Rebroadcast layer — BLE write-without-response can drop packets,
-     * so periodic resend ensures peripherals stay in sync. */
+     * so periodic resend ensures peripherals stay in sync.
+     * Bypass the debounce/deduplication path so the value always goes out. */
     broadcast_layer(layer_cache);
+    last_broadcast_layer = layer_cache; /* keep dedup state in sync */
 
     /* Reschedule */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
@@ -452,6 +488,11 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
     relay->discovery_in_progress = false;
+
+    /* Reset last_broadcast_layer so the reconnecting peripheral gets a fresh
+     * layer push via push_cached_state after discovery, even if the layer
+     * hasn't changed on the dongle side. */
+    last_broadcast_layer = 0xFF;
 }
 
 BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
@@ -467,21 +508,32 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
-        LOG_INF("relay_central: peripheral battery event source=%u level=%u",
-                periph_ev->source, periph_ev->state_of_charge);
-        /* Cache before broadcasting */
-        if (periph_ev->source < ARRAY_SIZE(battery_cache)) {
-            battery_cache[periph_ev->source] = periph_ev->state_of_charge;
+        uint8_t source = periph_ev->source;
+        uint8_t level  = periph_ev->state_of_charge;
+        LOG_INF("relay_central: peripheral battery event source=%u level=%u", source, level);
+        /* Deduplicate: skip write if this source is already cached at this level.
+         * Battery levels change slowly (at most once per minute), so repeated
+         * identical events should not generate writes. */
+        if (source < ARRAY_SIZE(battery_cache) && battery_cache[source] == level) {
+            return ZMK_EV_EVENT_BUBBLE;
         }
-        broadcast_battery(periph_ev->source, periph_ev->state_of_charge);
+        if (source < ARRAY_SIZE(battery_cache)) {
+            battery_cache[source] = level;
+        }
+        broadcast_battery(source, level);
         return ZMK_EV_EVENT_BUBBLE;
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     const struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     if (bat_ev) {
-        dongle_battery_cache = bat_ev->state_of_charge;
-        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, bat_ev->state_of_charge);
+        uint8_t level = bat_ev->state_of_charge;
+        /* Deduplicate dongle battery as well */
+        if (dongle_battery_cache == level) {
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+        dongle_battery_cache = level;
+        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, level);
         return ZMK_EV_EVENT_BUBBLE;
     }
 #endif
@@ -490,7 +542,10 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
     if (layer_ev) {
         uint8_t highest = zmk_keymap_highest_layer_active();
         layer_cache = highest;
-        broadcast_layer(highest);
+        /* Debounce: hold-tap layer keys fire rapid activate/deactivate pairs.
+         * k_work_reschedule resets the deadline on each new event; the work
+         * handler sends only the settled value, collapsing bursts into one write. */
+        k_work_reschedule(&layer_debounce_work, K_MSEC(LAYER_DEBOUNCE_MS));
         return ZMK_EV_EVENT_BUBBLE;
     }
 
