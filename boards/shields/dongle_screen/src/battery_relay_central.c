@@ -19,6 +19,11 @@
  *   7. Periodically re-broadcasts battery state for resilience against
  *      dropped BLE writes.
  *
+ * IMPORTANT: All bt_gatt_write_without_response calls are serialized through
+ * a dedicated writer thread.  This function can block waiting for BT TX
+ * buffers — if called directly from the system work queue, it deadlocks
+ * because the BT stack needs the system work queue for TX completion.
+ *
  * This allows peripherals with displays (e.g. nice_view_gem) to show battery
  * levels for all keyboard splits and the current active layer.
  */
@@ -46,6 +51,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static uint8_t layer_cache;
 
+/* Diagnostic counters — read from dongle display for debugging */
+volatile uint32_t relay_diag_conn_count;      /* relay_connected calls */
+volatile uint32_t relay_diag_disc_start;      /* discovery attempts */
+volatile uint32_t relay_diag_disc_ok;         /* discovery successes */
+volatile uint32_t relay_diag_disc_fail;       /* discovery not-found */
+volatile uint32_t relay_diag_disc_err;        /* bt_gatt_discover errors */
+volatile uint32_t relay_diag_write_ok;        /* successful writes */
+volatile uint32_t relay_diag_write_err;       /* failed writes */
+
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
 static uint8_t dongle_battery_cache;
 #endif
@@ -69,6 +83,8 @@ struct peripheral_relay {
     struct bt_gatt_discover_params discover_params;
     struct bt_uuid_128 discover_uuid; /* copy kept alive for async discovery */
     struct k_work_delayable discovery_work;
+    struct k_work_delayable watchdog_work; /* fires if discovery callback never comes */
+    bool discovery_in_progress;      /* true between bt_gatt_discover and callback */
     uint8_t discover_retries;        /* remaining retries on transient errors */
 };
 
@@ -76,17 +92,20 @@ struct peripheral_relay {
  * ZMK's split stack also does GATT discovery on connect;
  * starting a concurrent discovery causes -EBUSY.
  * 2000 ms gives ZMK time to complete its own setup first. */
-#define RELAY_DISCOVERY_DELAY_MS 2000
+#define RELAY_DISCOVERY_DELAY_MS 5000
 
 /* Extra stagger per relay-slot index so peripherals that connect
  * simultaneously don't start GATT discovery at the same time. */
-#define RELAY_DISCOVERY_STAGGER_MS 2000
+#define RELAY_DISCOVERY_STAGGER_MS 3000
 
 /* How many times to retry bt_gatt_discover on transient errors. */
 #define RELAY_DISCOVERY_MAX_RETRIES 5
 
 /* Delay between discovery retries (ms). */
-#define RELAY_DISCOVERY_RETRY_DELAY_MS 2000
+#define RELAY_DISCOVERY_RETRY_DELAY_MS 3000
+
+/* Watchdog: if discovery callback never fires, retry after this (ms). */
+#define RELAY_DISCOVERY_WATCHDOG_MS 8000
 
 /* How often to re-broadcast cached battery state (ms). */
 #define RELAY_PERIODIC_BROADCAST_MS 60000
@@ -116,18 +135,71 @@ static int get_relay_index(const struct peripheral_relay *relay) {
 }
 
 /* -------------------------------------------------------------------------
- * Write helpers
+ * Serialized write queue
+ *
+ * bt_gatt_write_without_response can block waiting for BT TX buffers.
+ * If called from the system work queue, this deadlocks because the BT
+ * stack needs the system work queue for TX completion callbacks.
+ *
+ * Solution: a message queue + dedicated writer thread.  Callers enqueue
+ * write requests (non-blocking), and the writer thread sends them one
+ * at a time.  Blocking on TX buffers is safe here because it doesn't
+ * hold up the system work queue.
+ * ---------------------------------------------------------------------- */
+
+struct relay_write_msg {
+    uint8_t relay_idx;    /* index into relays[] */
+    struct battery_relay_data data;
+};
+
+#define RELAY_WRITE_QUEUE_SIZE 16
+K_MSGQ_DEFINE(relay_write_msgq, sizeof(struct relay_write_msg), RELAY_WRITE_QUEUE_SIZE, 4);
+
+#define RELAY_WRITER_STACK_SIZE 1024
+#define RELAY_WRITER_PRIORITY   K_PRIO_PREEMPT(8)
+
+K_THREAD_STACK_DEFINE(relay_writer_stack, RELAY_WRITER_STACK_SIZE);
+static struct k_thread relay_writer_thread;
+
+static void relay_writer_func(void *p1, void *p2, void *p3) {
+    struct relay_write_msg msg;
+
+    while (true) {
+        /* Block until a write request is available */
+        k_msgq_get(&relay_write_msgq, &msg, K_FOREVER);
+
+        struct peripheral_relay *relay = &relays[msg.relay_idx];
+        if (relay->conn == NULL) {
+            continue;
+        }
+
+        /* This call may block waiting for TX buffers — that's OK
+         * because we're on a dedicated thread, not the system work queue. */
+        int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
+                                                  &msg.data, sizeof(msg.data), false);
+        if (err) {
+            relay_diag_write_err++;
+            LOG_WRN("relay_writer: write failed: %d (relay %u)", err, msg.relay_idx);
+        } else {
+            relay_diag_write_ok++;
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Write helpers — enqueue to writer thread instead of writing directly
  * ---------------------------------------------------------------------- */
 
 static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
     if (!relay->bat_ready || relay->conn == NULL) {
         return;
     }
-    struct battery_relay_data data = { .source = source, .level = level };
-    int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
-                                             &data, sizeof(data), false);
-    if (err) {
-        LOG_WRN("battery_relay: write failed: %d", err);
+    struct relay_write_msg msg = {
+        .relay_idx = (uint8_t)get_relay_index(relay),
+        .data = { .source = source, .level = level },
+    };
+    if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
+        LOG_WRN("relay: write queue full, dropping write (source=%u)", source);
     }
 }
 
@@ -135,13 +207,12 @@ static void write_layer_to_relay(struct peripheral_relay *relay, uint8_t layer) 
     if (!relay->layer_ready || relay->conn == NULL) {
         return;
     }
-    /* Layer data is multiplexed through the battery relay characteristic
-     * using source=BATTERY_RELAY_SOURCE_LAYER, level=layer_index. */
-    struct battery_relay_data data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer };
-    int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
-                                             &data, sizeof(data), false);
-    if (err) {
-        LOG_WRN("layer_relay: write failed: %d", err);
+    struct relay_write_msg msg = {
+        .relay_idx = (uint8_t)get_relay_index(relay),
+        .data = { .source = BATTERY_RELAY_SOURCE_LAYER, .level = layer },
+    };
+    if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
+        LOG_WRN("relay: write queue full, dropping layer write");
     }
 }
 
@@ -187,9 +258,12 @@ static void push_cached_state(struct peripheral_relay *relay) {
 static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                       struct bt_gatt_discover_params *params) {
     struct peripheral_relay *relay = CONTAINER_OF(params, struct peripheral_relay, discover_params);
+    relay->discovery_in_progress = false;
+    k_work_cancel_delayable(&relay->watchdog_work);
 
     if (!attr) {
         if (!relay->bat_ready) {
+            relay_diag_disc_fail++;
             LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
             /* Retry with delay if retries remain, otherwise give up */
             if (relay->discover_retries > 0) {
@@ -206,6 +280,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
         return BT_GATT_ITER_STOP;
     }
 
+    relay_diag_disc_ok++;
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready = true;
@@ -218,6 +293,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn, const struct bt_gatt_
 }
 
 static void start_battery_discovery(struct peripheral_relay *relay) {
+    relay_diag_disc_start++;
     memcpy(&relay->discover_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->discover_uuid));
 
     relay->discover_params.uuid = &relay->discover_uuid.uuid;
@@ -226,8 +302,11 @@ static void start_battery_discovery(struct peripheral_relay *relay) {
     relay->discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
     relay->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
+    relay->discovery_in_progress = true;
     int err = bt_gatt_discover(relay->conn, &relay->discover_params);
     if (err) {
+        relay->discovery_in_progress = false;
+        relay_diag_disc_err++;
         LOG_ERR("battery_relay: bt_gatt_discover failed: %d (retries left %u)",
                 err, relay->discover_retries);
         /* Retry on transient errors */
@@ -237,6 +316,10 @@ static void start_battery_discovery(struct peripheral_relay *relay) {
             k_work_schedule(&relay->discovery_work,
                             K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
         }
+    } else {
+        /* Arm watchdog — if callback never fires, retry discovery */
+        k_work_schedule(&relay->watchdog_work,
+                        K_MSEC(RELAY_DISCOVERY_WATCHDOG_MS));
     }
 }
 
@@ -253,6 +336,24 @@ static void discovery_work_handler(struct k_work *work) {
          * so no separate discovery needed — just mark ready. */
         relay->layer_ready = true;
         push_cached_state(relay);
+    }
+}
+
+static void watchdog_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct peripheral_relay *relay = CONTAINER_OF(dwork, struct peripheral_relay, watchdog_work);
+    if (relay->conn == NULL || relay->bat_ready) {
+        return;
+    }
+    /* Discovery callback never fired — retry if retries remain */
+    LOG_WRN("battery_relay: watchdog fired, discovery callback never came (retries %u)",
+            relay->discover_retries);
+    relay->discovery_in_progress = false;
+    if (relay->discover_retries > 0) {
+        relay->discover_retries--;
+        k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+    } else {
+        LOG_ERR("battery_relay: giving up after watchdog exhausted retries");
     }
 }
 
@@ -304,6 +405,8 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
         return;
     }
 
+    relay_diag_conn_count++;
+
     struct peripheral_relay *relay = get_free_relay();
     if (!relay) {
         LOG_WRN("battery_relay: no free relay slot for new connection");
@@ -314,9 +417,11 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
+    relay->discovery_in_progress = false;
     relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
 
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
+    k_work_init_delayable(&relay->watchdog_work, watchdog_work_handler);
 
     /* Stagger discovery start per relay index so that peripherals
      * connecting at the same time don't start concurrent GATT
@@ -339,11 +444,13 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_DBG("relay: peripheral disconnected (reason %u), clearing slot", reason);
     k_work_cancel_delayable(&relay->discovery_work);
+    k_work_cancel_delayable(&relay->watchdog_work);
     bt_conn_unref(relay->conn);
     relay->conn = NULL;
     relay->bat_ready = false;
     relay->bat_char_handle = 0;
     relay->layer_ready = false;
+    relay->discovery_in_progress = false;
 }
 
 BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
@@ -397,3 +504,17 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
 #endif
 
+/* -------------------------------------------------------------------------
+ * Writer thread initialization
+ * ---------------------------------------------------------------------- */
+
+static int relay_writer_init(void) {
+    k_thread_create(&relay_writer_thread, relay_writer_stack,
+                    K_THREAD_STACK_SIZEOF(relay_writer_stack),
+                    relay_writer_func, NULL, NULL, NULL,
+                    RELAY_WRITER_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&relay_writer_thread, "relay_writer");
+    return 0;
+}
+
+SYS_INIT(relay_writer_init, APPLICATION, 99);
