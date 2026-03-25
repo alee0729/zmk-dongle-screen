@@ -59,8 +59,11 @@ static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 static bool battery_dirty[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 /* True when the keyboard is actively in use.  Writes are suppressed while
- * active to avoid competing with HID split protocol for BLE TX bandwidth. */
-static bool keyboard_active = true; /* conservative default — wait for first IDLE event */
+ * active to avoid competing with HID split protocol for BLE TX bandwidth.
+ * Read by the writer thread; written by the event handler.  On ARM the
+ * bool read/write is a single instruction — no explicit atomic needed for
+ * this advisory flag, but volatile ensures the compiler re-reads each time. */
+static volatile bool keyboard_active = true; /* conservative default — wait for first IDLE event */
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
 static uint8_t dongle_battery_cache;
@@ -75,6 +78,7 @@ volatile uint32_t relay_diag_disc_fail;
 volatile uint32_t relay_diag_disc_err;
 volatile uint32_t relay_diag_write_ok;
 volatile uint32_t relay_diag_write_err;
+volatile uint32_t relay_diag_write_dropped; /* writes dropped because keyboard became active */
 
 /* -------------------------------------------------------------------------
  * Per-peripheral relay state
@@ -142,6 +146,17 @@ static void relay_writer_func(void *p1, void *p2, void *p3) {
     struct relay_write_msg msg;
     while (true) {
         k_msgq_get(&relay_write_msgq, &msg, K_FOREVER);
+
+        /* Drop write if keyboard became active while this message was queued.
+         * The activity handler also calls k_msgq_purge() on IDLE→ACTIVE, so
+         * this check handles the narrow window between purge and the next get. */
+        if (keyboard_active) {
+            relay_diag_write_dropped++;
+            LOG_DBG("relay_writer: dropping write (keyboard active, source=%u)",
+                    msg.data.source);
+            continue;
+        }
+
         struct peripheral_relay *relay = &relays[msg.relay_idx];
         if (relay->conn == NULL) continue;
         int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
@@ -401,6 +416,14 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
         keyboard_active = (activity_ev->state == ZMK_ACTIVITY_ACTIVE);
         LOG_DBG("relay: activity state → %s",
                 keyboard_active ? "ACTIVE" : "IDLE/SLEEP");
+        if (!was_active && keyboard_active) {
+            /* Transitioning back to active typing — immediately purge any
+             * writes that were queued during the idle window but not yet
+             * sent.  The writer thread also checks keyboard_active, but
+             * purging here avoids even dequeuing stale messages. */
+            k_msgq_purge(&relay_write_msgq);
+            LOG_DBG("relay: purged write queue on IDLE→ACTIVE transition");
+        }
         if (was_active && !keyboard_active) {
             /* Just transitioned from active typing to idle/sleep.
              * Safe to send relay writes now. */
