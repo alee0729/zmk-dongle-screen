@@ -517,4 +517,4 @@ static int relay_writer_init(void) {
     return 0;
 }
 
-SYS_INIT(relay_writer_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+SYS_INIT(relay_writer_init, APPLICATION, 99);
