@@ -7,7 +7,8 @@
  * ======================================
  * When enabled, the central:
  *   1. Registers BT connection callbacks.
- *   2. On peripheral connect, discovers the battery relay GATT characteristic.
+ *   2. On peripheral connect, waits for the keyboard to become idle, then
+ *      discovers the battery relay GATT characteristic.
  *   3. Subscribes to ZMK battery and activity-state events.
  *   4. On every battery change, updates a dirty flag but does NOT write
  *      immediately. Writes are deferred until the keyboard becomes idle/sleep.
@@ -15,14 +16,17 @@
  *      values to every connected peripheral via GATT write-without-response.
  *   6. Periodically marks state dirty so stale displays resync on next idle.
  *
- * WHY IDLE-GATING:
+ * WHY IDLE-GATING FOR BOTH DISCOVERY AND WRITES:
  *   The nRF52840 BLE connection between dongle and each shield is a shared
  *   radio resource.  Both the split keyboard HID protocol (peripheral→central
- *   keystrokes) and relay writes (central→peripheral display data) share the
- *   same connection events and ATT bearer.  Any write during a typing burst
- *   can steal a connection event slot needed for a keystroke, causing a
- *   missed key.  Battery levels change only every few minutes, so deferring
- *   writes to idle periods costs nothing perceptible in display latency.
+ *   keystrokes) and relay ATT traffic (central→peripheral, both discovery
+ *   and writes) share the same connection events and ATT bearer.  Any relay
+ *   ATT transaction during a typing burst can steal a connection event slot
+ *   needed for a keystroke, causing a missed key.
+ *
+ *   Discovery (bt_gatt_discover) is a multi-round-trip ATT procedure — it
+ *   is MORE disruptive than a single write.  Both are therefore deferred
+ *   until the keyboard is idle.
  *
  * IMPORTANT: All bt_gatt_write_without_response calls are serialized through
  * a dedicated writer thread.  This function can block waiting for BT TX
@@ -58,8 +62,9 @@ static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
  * Cleared by flush_dirty() after the value is broadcast to all peripherals. */
 static bool battery_dirty[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
-/* True when the keyboard is actively in use.  Writes are suppressed while
- * active to avoid competing with HID split protocol for BLE TX bandwidth.
+/* True when the keyboard is actively in use.  ALL relay ATT traffic
+ * (discovery and writes) is suppressed while active to avoid competing
+ * with the HID split protocol for BLE connection event slots.
  * Read by the writer thread; written by the event handler.  On ARM the
  * bool read/write is a single instruction — no explicit atomic needed for
  * this advisory flag, but volatile ensures the compiler re-reads each time. */
@@ -73,6 +78,7 @@ static bool dongle_battery_dirty;
 /* Diagnostic counters */
 volatile uint32_t relay_diag_conn_count;
 volatile uint32_t relay_diag_disc_start;
+volatile uint32_t relay_diag_disc_deferred; /* discovery attempts deferred due to active keyboard */
 volatile uint32_t relay_diag_disc_ok;
 volatile uint32_t relay_diag_disc_fail;
 volatile uint32_t relay_diag_disc_err;
@@ -97,11 +103,17 @@ struct peripheral_relay {
     uint8_t discover_retries;
 };
 
+/* Initial delay before first discovery attempt after connect.
+ * Gives ZMK's own split protocol GATT setup time to complete first. */
 #define RELAY_DISCOVERY_DELAY_MS       5000
+/* Additional stagger per peripheral index to avoid simultaneous discoveries. */
 #define RELAY_DISCOVERY_STAGGER_MS     3000
+/* How long to wait before retrying a failed discovery. */
 #define RELAY_DISCOVERY_MAX_RETRIES    5
 #define RELAY_DISCOVERY_RETRY_DELAY_MS 3000
+/* How long to wait for a discovery callback before assuming it's stuck. */
 #define RELAY_DISCOVERY_WATCHDOG_MS    8000
+/* How often to re-mark state dirty for resilience resyncs. */
 #define RELAY_PERIODIC_BROADCAST_MS    60000
 
 static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
@@ -199,7 +211,7 @@ static void broadcast_battery(uint8_t source, uint8_t level) {
 /* -------------------------------------------------------------------------
  * Idle-gated flush
  *
- * Called only when keyboard_active transitions false (IDLE or SLEEP).
+ * Called only when keyboard_active is false (IDLE or SLEEP).
  * Sends all pending dirty battery values to connected peripherals.
  * ---------------------------------------------------------------------- */
 
@@ -299,11 +311,23 @@ static void discovery_work_handler(struct k_work *work) {
     if (relay->conn == NULL) return;
 
     if (!relay->bat_ready) {
+        if (keyboard_active) {
+            /* Keyboard is active — do NOT start GATT discovery now.
+             * bt_gatt_discover is a multi-round-trip ATT procedure; running it
+             * during typing competes with HID keystroke data for BLE connection
+             * event slots and causes dropped keys.
+             * Reschedule without decrementing retries; we'll keep checking
+             * until the keyboard goes idle. */
+            relay_diag_disc_deferred++;
+            LOG_DBG("battery_relay: deferring discovery (keyboard active, relay %d)",
+                    get_relay_index(relay));
+            k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+            return;
+        }
         start_battery_discovery(relay);
     } else {
         /* Discovery complete — mark cached state dirty and flush if idle.
-         * If keyboard is active, writes will be deferred to next IDLE transition.
-         * This prevents discovery-triggered writes from competing with keystrokes. */
+         * If keyboard is active, writes will be deferred to next IDLE transition. */
         mark_all_dirty();
         if (!keyboard_active) {
             flush_dirty();
@@ -374,6 +398,9 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
     k_work_init_delayable(&relay->watchdog_work, watchdog_work_handler);
 
+    /* Schedule first discovery attempt after the initial delay.
+     * If the keyboard is active when this fires, discovery_work_handler
+     * will defer and keep rescheduling until the keyboard goes idle. */
     uint32_t delay = RELAY_DISCOVERY_DELAY_MS +
                      (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
     k_work_schedule(&relay->discovery_work, K_MSEC(delay));
@@ -409,7 +436,7 @@ BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
  * ---------------------------------------------------------------------- */
 
 static int relay_central_event_handler(const zmk_event_t *eh) {
-    /* Activity state — the idle gate */
+    /* Activity state — the idle gate for ALL relay ATT traffic */
     const struct zmk_activity_state_changed *activity_ev = as_zmk_activity_state_changed(eh);
     if (activity_ev) {
         bool was_active = keyboard_active;
