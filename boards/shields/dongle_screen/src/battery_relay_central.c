@@ -32,6 +32,15 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+/*
+ * CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_COUNT is only present when ZMK_SPLIT_BLE is
+ * selected in Kconfig.  Fall back to 2 (standard left+right split) when the
+ * symbol is absent so static array declarations compile on all build targets.
+ */
+#ifndef CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_COUNT
+#define CONFIG_ZMK_SPLIT_BLE_PERIPHERAL_COUNT 2
+#endif
+
 /* -------------------------------------------------------------------------
  * Constants
  * ---------------------------------------------------------------------- */
