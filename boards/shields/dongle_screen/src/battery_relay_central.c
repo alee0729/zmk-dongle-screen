@@ -222,7 +222,10 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 
     if (!attr) {
         if (!relay->ready) {
-            LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
+            LOG_DBG("battery_relay: characteristic not found on peripheral %d, retrying in %d ms",
+                    get_relay_index(relay), RELAY_DISCOVERY_RETRY_DELAY_MS);
+            k_work_schedule(&relay->discovery_work,
+                            K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
         }
         return BT_GATT_ITER_STOP;
     }
