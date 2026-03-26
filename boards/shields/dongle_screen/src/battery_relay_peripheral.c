@@ -20,27 +20,12 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
 
+#include <zmk/events/battery_state_changed.h>
 #include <zmk/event_manager.h>
-#include <zmk/events/layer_state_changed.h>
 
 #include "battery_relay_central.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
-
-/*
- * On peripheral builds zmk/split/central.h is not available, so the
- * zmk_peripheral_battery_state_changed event struct is not declared.
- * Provide a local declaration + implementation so we can raise it here
- * and have the battery_status widget (which subscribes unconditionally)
- * pick it up.
- */
-struct zmk_peripheral_battery_state_changed {
-    uint8_t source;
-    uint8_t state_of_charge;
-};
-
-ZMK_EVENT_DECLARE(zmk_peripheral_battery_state_changed);
-ZMK_EVENT_IMPL(zmk_peripheral_battery_state_changed);
 
 /* -------------------------------------------------------------------------
  * Relay cache
@@ -51,11 +36,6 @@ ZMK_EVENT_IMPL(zmk_peripheral_battery_state_changed);
  * ---------------------------------------------------------------------- */
 
 static uint8_t relay_cache[CONFIG_DONGLE_SCREEN_BATTERY_RELAY_SOURCE_COUNT];
-static uint8_t relayed_layer;
-
-uint8_t battery_relay_get_layer(void) {
-    return relayed_layer;
-}
 
 /* -------------------------------------------------------------------------
  * GATT write handler
@@ -72,26 +52,9 @@ static ssize_t battery_relay_write_cb(struct bt_conn *conn,
     }
 
     const struct battery_relay_data *data = buf;
-    LOG_INF("relay_periph: write received source=%u level=%u", data->source, data->level);
 
     /* Ignore the dongle's own battery (no slot for it on peripheral display) */
     if (data->source == BATTERY_RELAY_SOURCE_DONGLE) {
-        return len;
-    }
-
-    /* Layer data is multiplexed through this characteristic.
-     * source=0xFE means level contains the active layer index.
-     * Store it and raise zmk_layer_state_changed so the layer_status
-     * widget redraws with the relayed value. */
-    if (data->source == BATTERY_RELAY_SOURCE_LAYER) {
-        relayed_layer = data->level;
-        LOG_DBG("relay: layer=%u", relayed_layer);
-        ZMK_EVENT_RAISE(new_zmk_layer_state_changed(
-            (struct zmk_layer_state_changed){
-                .layer = relayed_layer,
-                .state = true,
-                .timestamp = k_uptime_get(),
-            }));
         return len;
     }
 
