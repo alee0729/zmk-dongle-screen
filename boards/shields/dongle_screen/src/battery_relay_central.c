@@ -166,10 +166,6 @@ K_THREAD_DEFINE(relay_writer_tid, 1024, relay_writer_func, NULL, NULL, NULL,
  * Write helpers
  * ---------------------------------------------------------------------- */
 
-/**
- * Enqueue a write to one peripheral relay slot.
- * Returns true if the message was successfully enqueued.
- */
 static bool write_battery_to_relay(int relay_idx, uint8_t source, uint8_t level) {
     struct peripheral_relay *relay = &relays[relay_idx];
     if (!relay->ready || relay->conn == NULL) return false;
@@ -181,10 +177,6 @@ static bool write_battery_to_relay(int relay_idx, uint8_t source, uint8_t level)
     return k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) == 0;
 }
 
-/**
- * Broadcast a battery value to all connected+discovered peripherals.
- * Returns true if at least one write was enqueued.
- */
 static bool broadcast_battery(uint8_t source, uint8_t level) {
     bool any_enqueued = false;
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
@@ -193,10 +185,6 @@ static bool broadcast_battery(uint8_t source, uint8_t level) {
     return any_enqueued;
 }
 
-/**
- * Mark all non-zero cached values dirty so they will be re-sent at the next
- * idle flush.
- */
 static void mark_all_dirty(void) {
     for (int i = 0; i < ARRAY_SIZE(battery_dirty); i++) {
         if (battery_cache[i] > 0) battery_dirty[i] = true;
@@ -206,11 +194,6 @@ static void mark_all_dirty(void) {
 #endif
 }
 
-/**
- * Send all dirty cached battery values.
- * Only clears the dirty flag if the write was successfully enqueued, so
- * that a value is never silently lost when all relays are still discovering.
- */
 static void flush_dirty(void) {
     for (int i = 0; i < ARRAY_SIZE(battery_dirty); i++) {
         if (battery_dirty[i] && battery_cache[i] > 0) {
@@ -259,7 +242,6 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 }
 
 static void start_discovery(struct peripheral_relay *relay) {
-    /* Copy the UUID so it stays alive for the duration of async discovery */
     memcpy(&relay->char_uuid, BATTERY_RELAY_CHAR_UUID, sizeof(relay->char_uuid));
 
     relay->discover_params.uuid = &relay->char_uuid.uuid;
@@ -283,7 +265,6 @@ static void discovery_work_handler(struct k_work *work) {
 
     if (!relay->ready) {
         if (keyboard_active) {
-            /* Defer until idle; stagger multiple relays to avoid concurrent discovers */
             uint32_t delay = RELAY_DISCOVERY_RETRY_DELAY_MS +
                              (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_DEFER_STAGGER_MS;
             LOG_DBG("battery_relay: deferring discovery for peripheral %d (%u ms)",
@@ -293,7 +274,6 @@ static void discovery_work_handler(struct k_work *work) {
         }
         start_discovery(relay);
     } else {
-        /* Already discovered (e.g. re-triggered after reconnect) — flush cache */
         mark_all_dirty();
         if (!keyboard_active) flush_dirty();
     }
@@ -319,7 +299,12 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err) {
     relay->ready = false;
     relay->char_handle = 0;
 
-    /* Delay initial discovery; defer further if keyboard is active */
+    /*
+     * Initialise the delayable work item here rather than in a SYS_INIT hook
+     * so we avoid SYS_INIT API differences across ZMK/Zephyr versions.
+     * k_work_init_delayable on a zeroed struct is safe and idempotent.
+     */
+    k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
     k_work_schedule(&relay->discovery_work,
                     K_MSEC(RELAY_DISCOVERY_INITIAL_DELAY_MS));
 }
@@ -347,7 +332,6 @@ BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
  * ---------------------------------------------------------------------- */
 
 static int battery_relay_central_event_handler(const zmk_event_t *eh) {
-    /* Peripheral battery update */
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
@@ -362,7 +346,6 @@ static int battery_relay_central_event_handler(const zmk_event_t *eh) {
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
-    /* Dongle battery update */
     const struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     if (bat_ev) {
         dongle_battery_cache = bat_ev->state_of_charge;
@@ -372,7 +355,6 @@ static int battery_relay_central_event_handler(const zmk_event_t *eh) {
     }
 #endif
 
-    /* Activity state change */
     const struct zmk_activity_state_changed *activity_ev =
         as_zmk_activity_state_changed(eh);
     if (activity_ev) {
@@ -380,18 +362,12 @@ static int battery_relay_central_event_handler(const zmk_event_t *eh) {
         keyboard_active = (activity_ev->state == ZMK_ACTIVITY_ACTIVE);
 
         if (!was_active && keyboard_active) {
-            /*
-             * Resuming typing: purge any writes that were queued during the
-             * idle window but haven't been sent yet, then re-mark everything
-             * dirty so the next idle will re-send them.
-             */
             k_msgq_purge(&relay_write_msgq);
             mark_all_dirty();
             LOG_DBG("relay: purged write queue on ACTIVE transition");
         }
 
         if (was_active && !keyboard_active) {
-            /* Became idle — send all pending battery values */
             flush_dirty();
         }
 
@@ -408,16 +384,3 @@ ZMK_SUBSCRIPTION(battery_relay_central, zmk_activity_state_changed);
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_battery_state_changed);
 #endif
-
-/* -------------------------------------------------------------------------
- * Initialise delayable work items (must be done at runtime)
- * ---------------------------------------------------------------------- */
-
-static int battery_relay_central_init(void) {
-    for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        k_work_init_delayable(&relays[i].discovery_work, discovery_work_handler);
-    }
-    return 0;
-}
-
-SYS_INIT(battery_relay_central_init, APPLICATION, 99);
