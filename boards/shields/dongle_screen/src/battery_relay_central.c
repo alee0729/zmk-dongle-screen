@@ -59,7 +59,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 static uint8_t battery_cache[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 /* Dirty flags: set when a cache value changes (or on reconnect/periodic).
- * Cleared by flush_dirty() after the value is broadcast to all peripherals. */
+ * Cleared by flush_dirty() only after the value is successfully enqueued
+ * for at least one relay.  If no relay is ready yet, the flag is kept so
+ * the value is retried when discovery completes. */
 static bool battery_dirty[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
 /* True when the keyboard is actively in use.  ALL relay ATT traffic
@@ -108,9 +110,13 @@ struct peripheral_relay {
 #define RELAY_DISCOVERY_DELAY_MS       5000
 /* Additional stagger per peripheral index to avoid simultaneous discoveries. */
 #define RELAY_DISCOVERY_STAGGER_MS     3000
-/* How long to wait before retrying a failed discovery. */
+/* How long to wait before retrying a failed or deferred discovery. */
 #define RELAY_DISCOVERY_MAX_RETRIES    5
 #define RELAY_DISCOVERY_RETRY_DELAY_MS 3000
+/* Extra stagger added per relay index when deferring due to active keyboard.
+ * Preserves ordering so both relays don't fire bt_gatt_discover simultaneously
+ * on the first idle window. */
+#define RELAY_DISCOVERY_DEFER_STAGGER_MS 1000
 /* How long to wait for a discovery callback before assuming it's stuck. */
 #define RELAY_DISCOVERY_WATCHDOG_MS    8000
 /* How often to re-mark state dirty for resilience resyncs. */
@@ -186,21 +192,29 @@ static void relay_writer_func(void *p1, void *p2, void *p3) {
  * Write helpers
  * ---------------------------------------------------------------------- */
 
-static void write_battery_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
-    if (!relay->bat_ready || relay->conn == NULL) return;
+/* Returns true if the write was successfully enqueued. */
+static bool write_battery_to_relay(struct peripheral_relay *relay, uint8_t source, uint8_t level) {
+    if (!relay->bat_ready || relay->conn == NULL) return false;
     struct relay_write_msg msg = {
         .relay_idx = (uint8_t)get_relay_index(relay),
         .data = { .source = source, .level = level },
     };
     if (k_msgq_put(&relay_write_msgq, &msg, K_NO_WAIT) != 0) {
         LOG_WRN("relay: write queue full, dropping write (source=%u)", source);
+        return false;
     }
+    return true;
 }
 
-static void broadcast_battery(uint8_t source, uint8_t level) {
+/* Returns true if the write was enqueued to at least one relay. */
+static bool broadcast_battery(uint8_t source, uint8_t level) {
+    bool any_enqueued = false;
     for (int i = 0; i < ARRAY_SIZE(relays); i++) {
-        write_battery_to_relay(&relays[i], source, level);
+        if (write_battery_to_relay(&relays[i], source, level)) {
+            any_enqueued = true;
+        }
     }
+    return any_enqueued;
 }
 
 /* Layer relay disabled:
@@ -213,19 +227,27 @@ static void broadcast_battery(uint8_t source, uint8_t level) {
  *
  * Called only when keyboard_active is false (IDLE or SLEEP).
  * Sends all pending dirty battery values to connected peripherals.
+ *
+ * A dirty flag is cleared only if the broadcast was enqueued to at least
+ * one relay.  If no relay has completed discovery yet (bat_ready=false),
+ * the flag is kept — it will be retried when discovery completes and calls
+ * mark_all_dirty() + flush_dirty().  This prevents silent data loss when
+ * flush runs before the first discovery finishes.
  * ---------------------------------------------------------------------- */
 
 static void flush_dirty(void) {
     for (int i = 0; i < ARRAY_SIZE(battery_dirty); i++) {
         if (battery_dirty[i] && battery_cache[i] > 0) {
-            battery_dirty[i] = false;
-            broadcast_battery((uint8_t)i, battery_cache[i]);
+            if (broadcast_battery((uint8_t)i, battery_cache[i])) {
+                battery_dirty[i] = false;
+            }
         }
     }
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     if (dongle_battery_dirty && dongle_battery_cache > 0) {
-        dongle_battery_dirty = false;
-        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
+        if (broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache)) {
+            dongle_battery_dirty = false;
+        }
     }
 #endif
     LOG_DBG("relay: flushed dirty battery state to peripherals");
@@ -316,12 +338,15 @@ static void discovery_work_handler(struct k_work *work) {
              * bt_gatt_discover is a multi-round-trip ATT procedure; running it
              * during typing competes with HID keystroke data for BLE connection
              * event slots and causes dropped keys.
-             * Reschedule without decrementing retries; we'll keep checking
-             * until the keyboard goes idle. */
+             *
+             * Add a per-relay stagger so both relays don't fire simultaneously
+             * on the first idle window after deferring in the same cycle. */
             relay_diag_disc_deferred++;
             LOG_DBG("battery_relay: deferring discovery (keyboard active, relay %d)",
                     get_relay_index(relay));
-            k_work_schedule(&relay->discovery_work, K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS));
+            k_work_schedule(&relay->discovery_work,
+                K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
+                       (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_DEFER_STAGGER_MS));
             return;
         }
         start_battery_discovery(relay);
@@ -444,12 +469,16 @@ static int relay_central_event_handler(const zmk_event_t *eh) {
         LOG_DBG("relay: activity state → %s",
                 keyboard_active ? "ACTIVE" : "IDLE/SLEEP");
         if (!was_active && keyboard_active) {
-            /* Transitioning back to active typing — immediately purge any
-             * writes that were queued during the idle window but not yet
-             * sent.  The writer thread also checks keyboard_active, but
-             * purging here avoids even dequeuing stale messages. */
+            /* Transitioning back to active typing.
+             *
+             * 1. Purge the write queue so nothing queued during the idle
+             *    window fires while keys are being pressed.
+             * 2. Re-mark everything dirty so the next idle window re-sends
+             *    whatever was dropped — without this, recovery would require
+             *    waiting up to 60 seconds for the periodic rebroadcast. */
             k_msgq_purge(&relay_write_msgq);
-            LOG_DBG("relay: purged write queue on IDLE→ACTIVE transition");
+            mark_all_dirty();
+            LOG_DBG("relay: purged queue and re-marked dirty on IDLE→ACTIVE");
         }
         if (was_active && !keyboard_active) {
             /* Just transitioned from active typing to idle/sleep.
