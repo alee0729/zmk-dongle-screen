@@ -420,4 +420,4 @@ static int battery_relay_central_init(void) {
     return 0;
 }
 
-SYS_INIT(battery_relay_central_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+SYS_INIT(battery_relay_central_init, APPLICATION, 99);
