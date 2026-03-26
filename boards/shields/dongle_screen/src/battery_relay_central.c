@@ -23,12 +23,10 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/logging/log.h>
 
-#include <zmk/split/central.h>
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/event_manager.h>
 #include <zmk/battery.h>
-#include <zmk/activity.h>
 
 #include "battery_relay_central.h"
 
