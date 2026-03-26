@@ -25,7 +25,6 @@
 
 #include <zmk/split/central.h>
 #include <zmk/events/battery_state_changed.h>
-#include <zmk/events/peripheral_battery_state_changed.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/event_manager.h>
 #include <zmk/battery.h>
