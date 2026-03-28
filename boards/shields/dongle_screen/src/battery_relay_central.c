@@ -8,42 +8,34 @@
  * When enabled, the central:
  *   1. Registers BT connection callbacks.
  *   2. On peripheral connect, discovers the battery relay GATT characteristic.
- *   3. Subscribes to ZMK battery and keypress events.
+ *   3. Subscribes to ZMK battery events.
  *   4. On every battery change, writes struct battery_relay_data to each
  *      connected peripheral that has been successfully discovered.
- *      - Left battery (source 0) and dongle battery relay without an idle gate.
- *      - Right battery (sources > 0) is gated: only relayed after both shields
- *        have been idle (no keypresses) for RIGHT_BAT_IDLE_THRESHOLD_MS (30 s).
- *        This prevents GATT write-without-response PDUs from competing with
- *        HID notifications sent the other way during active typing.
  *   5. Caches battery levels so newly-discovered peripherals get current state
  *      after GATT discovery completes.
  *   6. Periodically re-broadcasts cached battery state for resilience.
  *
- * Idle detection
- * --------------
- * A 5-second periodic work item (bat_relay_idle_check_work) checks whether
- * both_shields_idle_enough() is true and, if so, calls flush_dirty on every
- * relay.  last_active_ms is updated by zmk_position_state_changed (actual
- * key presses from either shield).  This avoids the cancel/reschedule race
- * that the previous one-shot approach was prone to.
+ * Write reliability
+ * -----------------
+ * bt_gatt_write_without_response is non-blocking and does not compete with
+ * HID keystroke data.  HID notifications flow shield→dongle; relay writes flow
+ * dongle→shield — opposite directions on separate TX queues.
  *
  * Dirty-flag invariant
  * --------------------
- * bat_dirty[src] is set whenever new battery data arrives and is cleared ONLY
- * after bt_gatt_write_without_response() returns 0.  Keypresses update
- * last_active_ms but never clear dirty flags, so the next idle window will
- * flush all accumulated data (fixes Issues 1 & 2).
+ * bat_dirty[src] is set whenever new battery data arrives or a write fails,
+ * and is cleared ONLY after bt_gatt_write_without_response() returns 0.
+ * A 5-second periodic retry work item (bat_relay_retry_work) flushes any
+ * remaining dirty writes, handling transient -ENOBUFS failures automatically.
  *
  * Discovery stagger
  * -----------------
  * All bt_gatt_discover retries use:
  *   RELAY_DISCOVERY_RETRY_DELAY_MS + idx * RELAY_DISCOVERY_STAGGER_MS
- * so that both peripherals never fire bt_gatt_discover simultaneously even
- * when they defer to the same idle window (fixes Issue 3).
+ * so that both peripherals never fire bt_gatt_discover simultaneously.
  *
  * Layer relay is temporarily disabled (code left in place but commented out)
- * while battery relay timing is being stabilised.
+ * while battery relay is being stabilised.
  */
 
 #include <zephyr/kernel.h>
@@ -52,7 +44,6 @@
 #include <zephyr/logging/log.h>
 
 #include <zmk/events/battery_state_changed.h>
-#include <zmk/events/position_state_changed.h>
 /* Layer relay DISABLED: #include <zmk/events/layer_state_changed.h> */
 #include <zmk/event_manager.h>
 #include <zmk/battery.h>
@@ -61,24 +52,6 @@
 #include "battery_relay_central.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
-
-/* -------------------------------------------------------------------------
- * Idle threshold for right-battery relay
- * ---------------------------------------------------------------------- */
-
-#define RIGHT_BAT_IDLE_THRESHOLD_MS 30000
-
-/*
- * Updated on every key-press event (zmk_position_state_changed, state=true).
- * Initialised to 0 so at power-on both_shields_idle_enough() becomes true
- * 30 s after boot if no keys are pressed.
- */
-static int64_t last_active_ms = 0;
-
-static bool both_shields_idle_enough(void)
-{
-    return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_IDLE_THRESHOLD_MS;
-}
 
 /* -------------------------------------------------------------------------
  * Cached state
@@ -107,7 +80,6 @@ struct peripheral_relay {
      * Dirty flags — one per peripheral-battery source index, plus dongle.
      * Set when new data arrives or a write fails.
      * Cleared ONLY after bt_gatt_write_without_response() returns 0.
-     * Keypresses never clear these flags; they just update last_active_ms.
      */
     bool bat_dirty[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
@@ -126,8 +98,8 @@ struct peripheral_relay {
 #define RELAY_DISCOVERY_RETRY_DELAY_MS 2000
 #define RELAY_PERIODIC_BROADCAST_MS    60000
 
-/* How often the idle-check work polls for a flush opportunity. */
-#define BAT_RELAY_IDLE_CHECK_MS        5000
+/* How often the retry work polls for pending dirty writes. */
+#define BAT_RELAY_RETRY_MS             5000
 
 static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
@@ -179,39 +151,32 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
- * flush_dirty — push pending battery data to a single relay.
+ * flush_dirty — push all pending battery data to a single relay.
  *
- * - Dirty flag cleared ONLY on successful write.
- * - Right-battery sources (index > 0) skipped when not idle.
- * - Returns true if any right-battery dirty flags remain after the flush
- *   (bat_ready false, -ENOBUFS, or not idle yet).
+ * Dirty flag cleared ONLY on successful write.
+ * Returns true if any dirty flags remain (bat_ready false or -ENOBUFS).
  * ---------------------------------------------------------------------- */
 
 static bool flush_dirty(struct peripheral_relay *relay)
 {
-    bool right_still_dirty = false;
+    bool still_dirty = false;
 
     if (!relay->bat_ready || relay->conn == NULL) {
-        /* Can't write yet; report whether right-battery work is pending. */
-        for (int src = 1; src < (int)ARRAY_SIZE(battery_cache); src++) {
-            if (relay->bat_dirty[src]) {
-                right_still_dirty = true;
-                break;
-            }
+        for (int src = 0; src < (int)ARRAY_SIZE(battery_cache); src++) {
+            if (relay->bat_dirty[src]) { still_dirty = true; break; }
         }
-        return right_still_dirty;
+#if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
+        if (relay->dongle_bat_dirty) still_dirty = true;
+#endif
+        return still_dirty;
     }
 
     for (int src = 0; src < (int)ARRAY_SIZE(battery_cache); src++) {
         if (!relay->bat_dirty[src]) continue;
-        if (src > 0 && !both_shields_idle_enough()) {
-            right_still_dirty = true;
-            continue;
-        }
         if (write_battery_to_relay(relay, (uint8_t)src, battery_cache[src]) == 0) {
             relay->bat_dirty[src] = false;
         } else {
-            if (src > 0) right_still_dirty = true;
+            still_dirty = true;
         }
     }
 
@@ -220,67 +185,41 @@ static bool flush_dirty(struct peripheral_relay *relay)
         if (write_battery_to_relay(relay, BATTERY_RELAY_SOURCE_DONGLE,
                                    dongle_battery_cache) == 0) {
             relay->dongle_bat_dirty = false;
+        } else {
+            still_dirty = true;
         }
     }
 #endif
 
-    return right_still_dirty;
+    return still_dirty;
 }
 
 /* -------------------------------------------------------------------------
- * Periodic idle-check work
+ * Periodic retry work
  *
- * Fires every BAT_RELAY_IDLE_CHECK_MS.  When both shields have been idle
- * for the full threshold it calls flush_dirty on every relay.  If writes
- * fail (bat_ready still false, -ENOBUFS) they will be retried on the next
- * tick.
- *
- * Using a simple periodic poll eliminates all cancel/reschedule complexity
- * and race conditions that caused the previous one-shot approach to miss
- * the flush window when keypresses kept rescheduling the work item.
+ * Fires every BAT_RELAY_RETRY_MS.  Flushes any dirty writes on every relay.
+ * Handles transient -ENOBUFS failures: if a write fails, the dirty flag stays
+ * set and will be retried on the next tick.
  * ---------------------------------------------------------------------- */
 
-static void bat_relay_idle_check_handler(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(bat_relay_idle_check_work, bat_relay_idle_check_handler);
+static void bat_relay_retry_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(bat_relay_retry_work, bat_relay_retry_handler);
 
-static void bat_relay_idle_check_handler(struct k_work *work)
+static void bat_relay_retry_handler(struct k_work *work)
 {
-    if (both_shields_idle_enough()) {
-        bool any_dirty = false;
-        for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-            if (flush_dirty(&relays[i])) {
-                any_dirty = true;
-            }
-        }
-        if (any_dirty) {
-            LOG_DBG("battery_relay: idle flush: some writes still pending");
-        }
+    for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
+        flush_dirty(&relays[i]);
     }
-    k_work_schedule(&bat_relay_idle_check_work, K_MSEC(BAT_RELAY_IDLE_CHECK_MS));
+    k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
 
 /* -------------------------------------------------------------------------
- * broadcast_battery
- *
- * Source 0 (left) and dongle battery written immediately.
- * Sources > 0 (right) deferred until idle threshold is met by marking
- * dirty — the periodic idle-check will flush them.
- * Any write failure also marks dirty for the same periodic retry.
+ * broadcast_battery — write to all relays, mark dirty on failure.
  * ---------------------------------------------------------------------- */
 
 static void broadcast_battery(uint8_t source, uint8_t level)
 {
-    bool is_right = (source < (uint8_t)ARRAY_SIZE(battery_cache) && source > 0);
-    bool idle_ok  = both_shields_idle_enough();
-
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-        if (is_right && !idle_ok) {
-            /* Defer: dirty flag; periodic check will flush when idle */
-            if (source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
-                relays[i].bat_dirty[source] = true;
-            }
-            continue;
-        }
         int err = write_battery_to_relay(&relays[i], source, level);
         if (err != 0 && source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
             relays[i].bat_dirty[source] = true;
@@ -290,9 +229,7 @@ static void broadcast_battery(uint8_t source, uint8_t level)
 
 /* -------------------------------------------------------------------------
  * push_cached_state — called once after GATT discovery succeeds.
- * Marks all cached sources dirty, then flushes whatever is currently
- * eligible (left + dongle immediately; right only if already idle).
- * Remaining dirty flags are picked up by bat_relay_idle_check_work.
+ * Marks all cached sources dirty and flushes immediately.
  * ---------------------------------------------------------------------- */
 
 static void push_cached_state(struct peripheral_relay *relay)
@@ -449,7 +386,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
 
     /* Start the background work items (no-op if already running). */
     k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
-    k_work_schedule(&bat_relay_idle_check_work, K_MSEC(BAT_RELAY_IDLE_CHECK_MS));
+    k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
 
 static void relay_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -477,24 +414,6 @@ BT_CONN_CB_DEFINE(battery_relay_conn_cb) = {
 
 static int relay_central_event_handler(const zmk_event_t *eh)
 {
-    /*
-     * Key press from either shield — update the idle clock.
-     * Only presses (state=true) are counted; releases do not reset the
-     * timer so the 30 s window starts from the last actual keydown.
-     * The periodic idle-check polls both_shields_idle_enough() and flushes
-     * when the threshold is met; no cancel/reschedule needed here.
-     */
-    const struct zmk_position_state_changed *pos_ev =
-        as_zmk_position_state_changed(eh);
-    if (pos_ev) {
-        if (pos_ev->state) {
-            last_active_ms = k_uptime_get();
-            LOG_DBG("battery_relay: keypress, idle clock reset (uptime %lld ms)",
-                    last_active_ms);
-        }
-        return ZMK_EV_EVENT_BUBBLE;
-    }
-
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
@@ -533,7 +452,6 @@ static int relay_central_event_handler(const zmk_event_t *eh)
 }
 
 ZMK_LISTENER(battery_relay_central, relay_central_event_handler);
-ZMK_SUBSCRIPTION(battery_relay_central, zmk_position_state_changed);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_peripheral_battery_state_changed);
 /* Layer relay DISABLED:
  * ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
