@@ -95,51 +95,6 @@ static uint8_t dongle_battery_cache;
 #endif
 
 /* -------------------------------------------------------------------------
- * Idle gate for right-battery relay
- *
- * Source 0 (left battery) and dongle battery relay immediately.
- * Source > 0 (right battery) is held until both shields have been idle
- * for RIGHT_BAT_IDLE_THRESHOLD_MS to avoid competing with HID traffic.
- * ---------------------------------------------------------------------- */
-
-static int64_t last_active_ms = 0;
-#define RIGHT_BAT_IDLE_THRESHOLD_MS 30000
-
-static bool both_shields_idle_enough(void)
-{
-    return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_IDLE_THRESHOLD_MS;
-}
-
-static void right_bat_idle_work_handler(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(right_bat_idle_work, right_bat_idle_work_handler);
-
-/* Forward declarations */
-static bool flush_dirty(struct peripheral_relay *relay);
-
-static void right_bat_idle_work_handler(struct k_work *work)
-{
-    if (!both_shields_idle_enough()) return;
-    extern struct peripheral_relay relays[];
-    extern int relays_count;
-    for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
-        flush_dirty(&relays[i]);
-    }
-}
-
-/*
- * Schedule the right-battery idle flush to fire when the idle threshold
- * is reached.  If already past the threshold, fire immediately.
- */
-static void schedule_right_bat_idle_flush(void)
-{
-    int64_t now      = k_uptime_get();
-    int64_t deadline = last_active_ms + RIGHT_BAT_IDLE_THRESHOLD_MS;
-    int64_t delay    = deadline - now;
-    if (delay < 0) delay = 0;
-    k_work_schedule(&right_bat_idle_work, K_MSEC((uint32_t)delay));
-}
-
-/* -------------------------------------------------------------------------
  * Per-peripheral relay state
  * ---------------------------------------------------------------------- */
 
@@ -245,6 +200,41 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
+ * Idle gate for right-battery relay
+ *
+ * Source 0 (left battery) and dongle battery relay immediately.
+ * Source > 0 (right battery) is held until both shields have been idle
+ * for RIGHT_BAT_IDLE_THRESHOLD_MS to avoid competing with HID traffic.
+ * ---------------------------------------------------------------------- */
+
+static int64_t last_active_ms = 0;
+#define RIGHT_BAT_IDLE_THRESHOLD_MS 30000
+
+static bool both_shields_idle_enough(void)
+{
+    return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_IDLE_THRESHOLD_MS;
+}
+
+/* Forward declarations needed before K_WORK_DELAYABLE_DEFINE */
+static void right_bat_idle_work_handler(struct k_work *work);
+static bool flush_dirty(struct peripheral_relay *relay);
+
+K_WORK_DELAYABLE_DEFINE(right_bat_idle_work, right_bat_idle_work_handler);
+
+/*
+ * Schedule the right-battery idle flush to fire when the idle threshold
+ * is reached.  If already past the threshold, fire immediately (delay=0).
+ */
+static void schedule_right_bat_idle_flush(void)
+{
+    int64_t now      = k_uptime_get();
+    int64_t deadline = last_active_ms + RIGHT_BAT_IDLE_THRESHOLD_MS;
+    int64_t delay    = deadline - now;
+    if (delay < 0) delay = 0;
+    k_work_schedule(&right_bat_idle_work, K_MSEC((uint32_t)delay));
+}
+
+/* -------------------------------------------------------------------------
  * flush_dirty — push all pending battery data to a single relay.
  *
  * Dirty flag cleared ONLY on successful write.
@@ -293,6 +283,22 @@ static bool flush_dirty(struct peripheral_relay *relay)
 #endif
 
     return still_dirty;
+}
+
+/* -------------------------------------------------------------------------
+ * right_bat_idle_work handler
+ *
+ * Fires after the idle threshold; flushes dirty right-battery writes on
+ * all relays.  Guard checks both_shields_idle_enough() in case the work
+ * was scheduled but activity resumed before it fired.
+ * ---------------------------------------------------------------------- */
+
+static void right_bat_idle_work_handler(struct k_work *work)
+{
+    if (!both_shields_idle_enough()) return;
+    for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
+        flush_dirty(&relays[i]);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -351,7 +357,7 @@ static void bat_relay_retry_handler(struct k_work *work)
 static void broadcast_battery(uint8_t source, uint8_t level)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-        /* Non-left-battery sources (right shield, etc.) need the idle gate */
+        /* Non-left-battery peripheral sources need the idle gate */
         if (source > 0 && source != BATTERY_RELAY_SOURCE_DONGLE) {
             if (!both_shields_idle_enough()) {
                 if (source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
@@ -389,7 +395,7 @@ static void push_cached_state(struct peripheral_relay *relay)
 
     flush_dirty(relay);
 
-    /* Schedule idle flush in case src>0 was gated */
+    /* Ensure src>0 dirty flags get flushed on next idle window */
     schedule_right_bat_idle_flush();
 
     /* Layer relay DISABLED: write_layer_to_relay(relay, layer_cache); */
