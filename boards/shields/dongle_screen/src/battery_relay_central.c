@@ -18,8 +18,8 @@
  * Write reliability
  * -----------------
  * bt_gatt_write_without_response is non-blocking and does not compete with
- * HID keystroke data.  HID notifications flow shield→dongle; relay writes flow
- * dongle→shield — opposite directions on separate TX queues.
+ * HID keystroke data.  HID notifications flow shield\u2192dongle; relay writes flow
+ * dongle\u2192shield \u2014 opposite directions on separate TX queues.
  *
  * Dirty-flag invariant
  * --------------------
@@ -27,6 +27,16 @@
  * and is cleared ONLY after bt_gatt_write_without_response() returns 0.
  * A 5-second periodic retry work item (bat_relay_retry_work) flushes any
  * remaining dirty writes, handling transient -ENOBUFS failures automatically.
+ *
+ * Discovery recovery
+ * ------------------
+ * Initial GATT discovery is attempted 2 s after connection (+ stagger per
+ * slot) with up to RELAY_DISCOVERY_MAX_RETRIES retries on transient errors.
+ * ZMK's own split/battery GATT operations run concurrently and can cause
+ * -EBUSY, exhausting those retries before the characteristic is found.
+ * The periodic retry work (bat_relay_retry_work) detects this and
+ * re-schedules discovery every BAT_RELAY_REDISCOVER_DELAY_MS until
+ * bat_ready becomes true.
  *
  * Discovery stagger
  * -----------------
@@ -77,7 +87,7 @@ struct peripheral_relay {
     /* Layer relay DISABLED: bool layer_ready; */
 
     /*
-     * Dirty flags — one per peripheral-battery source index, plus dongle.
+     * Dirty flags \u2014 one per peripheral-battery source index, plus dongle.
      * Set when new data arrives or a write fails.
      * Cleared ONLY after bt_gatt_write_without_response() returns 0.
      */
@@ -100,6 +110,14 @@ struct peripheral_relay {
 
 /* How often the retry work polls for pending dirty writes. */
 #define BAT_RELAY_RETRY_MS             5000
+
+/*
+ * How long to wait before re-attempting GATT discovery from the periodic
+ * retry work, for relays where initial discovery exhausted its retries.
+ * This gives ZMK's own GATT operations (split service setup, battery
+ * fetching) time to finish before we compete for the ATT bearer.
+ */
+#define BAT_RELAY_REDISCOVER_DELAY_MS  5000
 
 static struct peripheral_relay relays[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 
@@ -125,7 +143,7 @@ static int get_relay_index(const struct peripheral_relay *relay)
 }
 
 /* -------------------------------------------------------------------------
- * Write helper — returns 0 on success, negative errno on failure.
+ * Write helper \u2014 returns 0 on success, negative errno on failure.
  * ---------------------------------------------------------------------- */
 
 static int write_battery_to_relay(struct peripheral_relay *relay,
@@ -151,7 +169,7 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
- * flush_dirty — push all pending battery data to a single relay.
+ * flush_dirty \u2014 push all pending battery data to a single relay.
  *
  * Dirty flag cleared ONLY on successful write.
  * Returns true if any dirty flags remain (bat_ready false or -ENOBUFS).
@@ -197,9 +215,15 @@ static bool flush_dirty(struct peripheral_relay *relay)
 /* -------------------------------------------------------------------------
  * Periodic retry work
  *
- * Fires every BAT_RELAY_RETRY_MS.  Flushes any dirty writes on every relay.
- * Handles transient -ENOBUFS failures: if a write fails, the dirty flag stays
- * set and will be retried on the next tick.
+ * Fires every BAT_RELAY_RETRY_MS.
+ *
+ * 1. For any relay that is connected but GATT discovery never succeeded,
+ *    re-schedule discovery_work (with reset retries) so that transient
+ *    -EBUSY errors at connection time don\u2019t permanently disable the relay.
+ *
+ * 2. Flush any dirty battery writes on every relay, handling transient
+ *    -ENOBUFS failures: if a write fails, the dirty flag stays set and
+ *    will be retried on the next tick.
  * ---------------------------------------------------------------------- */
 
 static void bat_relay_retry_handler(struct k_work *work);
@@ -208,13 +232,30 @@ K_WORK_DELAYABLE_DEFINE(bat_relay_retry_work, bat_relay_retry_handler);
 static void bat_relay_retry_handler(struct k_work *work)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-        flush_dirty(&relays[i]);
+        struct peripheral_relay *relay = &relays[i];
+
+        /*
+         * If the peripheral is connected but we never found the relay
+         * characteristic, re-attempt discovery.  This recovers from the
+         * case where ZMK\u2019s own GATT operations (split-service setup,
+         * CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING discovery)
+         * returned -EBUSY for our initial attempts and exhausted retries.
+         */
+        if (relay->conn != NULL && !relay->bat_ready &&
+            !k_work_delayable_is_pending(&relay->discovery_work)) {
+            LOG_WRN("battery_relay[%d]: discovery not complete, re-scheduling", i);
+            relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
+            k_work_schedule(&relay->discovery_work,
+                            K_MSEC(BAT_RELAY_REDISCOVER_DELAY_MS));
+        }
+
+        flush_dirty(relay);
     }
     k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
 
 /* -------------------------------------------------------------------------
- * broadcast_battery — write to all relays, mark dirty on failure.
+ * broadcast_battery \u2014 write to all relays, mark dirty on failure.
  * ---------------------------------------------------------------------- */
 
 static void broadcast_battery(uint8_t source, uint8_t level)
@@ -228,7 +269,7 @@ static void broadcast_battery(uint8_t source, uint8_t level)
 }
 
 /* -------------------------------------------------------------------------
- * push_cached_state — called once after GATT discovery succeeds.
+ * push_cached_state \u2014 called once after GATT discovery succeeds.
  * Marks all cached sources dirty and flushes immediately.
  * ---------------------------------------------------------------------- */
 
@@ -264,14 +305,18 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
 
     if (!attr) {
         if (!relay->bat_ready) {
-            LOG_DBG("battery_relay: characteristic not found on conn %p", (void *)conn);
+            /* LOG_WRN so this is visible at default log level without
+             * enabling CONFIG_ZMK_LOG_LEVEL_DBG. */
+            LOG_WRN("battery_relay[%d]: characteristic not found (retries=%u)",
+                    idx, relay->discover_retries);
             if (relay->discover_retries > 0) {
                 relay->discover_retries--;
                 k_work_schedule(&relay->discovery_work,
                                 K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
                                        (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
             } else {
-                LOG_ERR("battery_relay: giving up discovery on conn %p", (void *)conn);
+                LOG_WRN("battery_relay[%d]: retries exhausted; "
+                        "retry work will re-attempt discovery", idx);
             }
         }
         return BT_GATT_ITER_STOP;
@@ -280,7 +325,8 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
     struct bt_gatt_chrc *chrc = attr->user_data;
     relay->bat_char_handle = chrc->value_handle;
     relay->bat_ready       = true;
-    LOG_INF("battery_relay: characteristic found, handle=%u", relay->bat_char_handle);
+    LOG_INF("battery_relay[%d]: characteristic found, handle=%u",
+            idx, relay->bat_char_handle);
 
     k_work_schedule(&relay->discovery_work, K_NO_WAIT);
     return BT_GATT_ITER_STOP;
@@ -300,8 +346,8 @@ static void start_battery_discovery(struct peripheral_relay *relay)
 
     int err = bt_gatt_discover(relay->conn, &relay->discover_params);
     if (err) {
-        LOG_ERR("battery_relay: bt_gatt_discover failed: %d (retries left %u)",
-                err, relay->discover_retries);
+        LOG_WRN("battery_relay[%d]: bt_gatt_discover err=%d (retries=%u)",
+                idx, err, relay->discover_retries);
         if (relay->discover_retries > 0 &&
             (err == -EBUSY || err == -ENOMEM || err == -EAGAIN)) {
             relay->discover_retries--;
@@ -309,6 +355,8 @@ static void start_battery_discovery(struct peripheral_relay *relay)
                             K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
                                    (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
         }
+        /* Non-transient errors (e.g. -EINVAL): retries exhausted path.
+         * The periodic retry work will re-initiate discovery later. */
     }
 }
 
@@ -368,6 +416,9 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
         return;
     }
 
+    int idx = get_relay_index(relay);
+    LOG_INF("battery_relay[%d]: peripheral connected, scheduling discovery", idx);
+
     relay->conn             = bt_conn_ref(conn);
     relay->bat_ready        = false;
     relay->bat_char_handle  = 0;
@@ -381,7 +432,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
     k_work_init_delayable(&relay->discovery_work, discovery_work_handler);
 
     uint32_t delay = RELAY_DISCOVERY_DELAY_MS +
-                     (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
+                     (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS;
     k_work_schedule(&relay->discovery_work, K_MSEC(delay));
 
     /* Start the background work items (no-op if already running). */
@@ -394,7 +445,8 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason)
     struct peripheral_relay *relay = get_relay_by_conn(conn);
     if (!relay) return;
 
-    LOG_DBG("relay: peripheral disconnected (reason %u)", reason);
+    LOG_INF("battery_relay[%d]: peripheral disconnected (reason %u)",
+            get_relay_index(relay), reason);
     k_work_cancel_delayable(&relay->discovery_work);
     bt_conn_unref(relay->conn);
     relay->conn            = NULL;
