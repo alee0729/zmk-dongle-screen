@@ -18,8 +18,8 @@
  * Write reliability
  * -----------------
  * bt_gatt_write_without_response is non-blocking and does not compete with
- * HID keystroke data.  HID notifications flow shield\u2192dongle; relay writes flow
- * dongle\u2192shield \u2014 opposite directions on separate TX queues.
+ * HID keystroke data.  HID notifications flow shield→dongle; relay writes flow
+ * dongle→shield — opposite directions on separate TX queues.
  *
  * Dirty-flag invariant
  * --------------------
@@ -28,20 +28,33 @@
  * A 5-second periodic retry work item (bat_relay_retry_work) flushes any
  * remaining dirty writes, handling transient -ENOBUFS failures automatically.
  *
+ * Idle gate for right-battery relay
+ * ----------------------------------
+ * Source 0 (left battery) and BATTERY_RELAY_SOURCE_DONGLE (dongle battery)
+ * are relayed immediately.  Source > 0 (right battery) is gated behind a
+ * RIGHT_BAT_IDLE_THRESHOLD_MS (30 s) both-shields-idle window.  This prevents
+ * GATT relay writes from competing with HID keystroke notifications during
+ * active typing.  The right_bat_idle_work fires after the threshold and
+ * flushes all pending dirty writes.
+ *
+ * When going ACTIVE, only the scheduled flush work is cancelled; dirty flags
+ * are preserved so the next idle window will flush them.  This avoids the
+ * IDLE→ACTIVE→IDLE cycle silently discarding data.
+ *
  * Discovery recovery
  * ------------------
  * Initial GATT discovery is attempted 2 s after connection (+ stagger per
  * slot) with up to RELAY_DISCOVERY_MAX_RETRIES retries on transient errors
  * (-EBUSY / -EAGAIN / -ENOMEM returned by bt_gatt_discover itself).
  *
- * ZMK\u2019s own split/battery GATT operations run concurrently and can cause
+ * ZMK’s own split/battery GATT operations run concurrently and can cause
  * -EBUSY, exhausting the initial retries before our discovery ever starts.
  * The periodic retry work detects this and re-schedules discovery every
- * BAT_RELAY_REDISCOVER_DELAY_MS \u2014 BUT ONLY when the discovery callback
- * never reported \u201cnot found\u201d (discovery_gave_up == false).  If the ATT bearer
- * already completed a discovery and the server replied \u201cno such attribute\u201d,
+ * BAT_RELAY_REDISCOVER_DELAY_MS — BUT ONLY when the discovery callback
+ * never reported “not found” (discovery_gave_up == false).  If the ATT bearer
+ * already completed a discovery and the server replied “no such attribute”,
  * it means the relay service is genuinely absent on that peripheral (e.g. the
- * right shield has no display) and we stop trying so we don\u2019t spam its ATT
+ * right shield has no display) and we stop trying so we don’t spam its ATT
  * channel and disrupt keystroke traffic.
  *
  * Discovery stagger
@@ -60,6 +73,7 @@
 #include <zephyr/logging/log.h>
 
 #include <zmk/events/battery_state_changed.h>
+#include <zmk/events/activity_state_changed.h>
 /* Layer relay DISABLED: #include <zmk/events/layer_state_changed.h> */
 #include <zmk/event_manager.h>
 #include <zmk/battery.h>
@@ -81,6 +95,51 @@ static uint8_t dongle_battery_cache;
 #endif
 
 /* -------------------------------------------------------------------------
+ * Idle gate for right-battery relay
+ *
+ * Source 0 (left battery) and dongle battery relay immediately.
+ * Source > 0 (right battery) is held until both shields have been idle
+ * for RIGHT_BAT_IDLE_THRESHOLD_MS to avoid competing with HID traffic.
+ * ---------------------------------------------------------------------- */
+
+static int64_t last_active_ms = 0;
+#define RIGHT_BAT_IDLE_THRESHOLD_MS 30000
+
+static bool both_shields_idle_enough(void)
+{
+    return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_IDLE_THRESHOLD_MS;
+}
+
+static void right_bat_idle_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(right_bat_idle_work, right_bat_idle_work_handler);
+
+/* Forward declarations */
+static bool flush_dirty(struct peripheral_relay *relay);
+
+static void right_bat_idle_work_handler(struct k_work *work)
+{
+    if (!both_shields_idle_enough()) return;
+    extern struct peripheral_relay relays[];
+    extern int relays_count;
+    for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
+        flush_dirty(&relays[i]);
+    }
+}
+
+/*
+ * Schedule the right-battery idle flush to fire when the idle threshold
+ * is reached.  If already past the threshold, fire immediately.
+ */
+static void schedule_right_bat_idle_flush(void)
+{
+    int64_t now      = k_uptime_get();
+    int64_t deadline = last_active_ms + RIGHT_BAT_IDLE_THRESHOLD_MS;
+    int64_t delay    = deadline - now;
+    if (delay < 0) delay = 0;
+    k_work_schedule(&right_bat_idle_work, K_MSEC((uint32_t)delay));
+}
+
+/* -------------------------------------------------------------------------
  * Per-peripheral relay state
  * ---------------------------------------------------------------------- */
 
@@ -92,7 +151,7 @@ struct peripheral_relay {
 
     /*
      * Set when discovery completed but the relay characteristic was not
-     * found on this peripheral (i.e. the server responded \u201cnot found\u201d).
+     * found on this peripheral (i.e. the server responded “not found”).
      * The periodic retry work skips re-discovery for this relay to avoid
      * spamming the ATT channel of peripherals without the relay service
      * (e.g. the right shield).
@@ -103,9 +162,10 @@ struct peripheral_relay {
     /* Layer relay DISABLED: bool layer_ready; */
 
     /*
-     * Dirty flags \u2014 one per peripheral-battery source index, plus dongle.
+     * Dirty flags — one per peripheral-battery source index, plus dongle.
      * Set when new data arrives or a write fails.
      * Cleared ONLY after bt_gatt_write_without_response() returns 0.
+     * Source > 0 flags are also subject to the idle gate.
      */
     bool bat_dirty[CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS];
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
@@ -130,7 +190,7 @@ struct peripheral_relay {
 /*
  * How long to wait before re-attempting GATT discovery from the periodic
  * retry work, for relays where initial discovery exhausted EBUSY retries
- * without the ATT discovery ever completing.  Gives ZMK\u2019s own GATT
+ * without the ATT discovery ever completing.  Gives ZMK’s own GATT
  * operations (split-service setup, battery-level fetching) time to finish.
  */
 #define BAT_RELAY_REDISCOVER_DELAY_MS  10000
@@ -159,7 +219,7 @@ static int get_relay_index(const struct peripheral_relay *relay)
 }
 
 /* -------------------------------------------------------------------------
- * Write helper \u2014 returns 0 on success, negative errno on failure.
+ * Write helper — returns 0 on success, negative errno on failure.
  * ---------------------------------------------------------------------- */
 
 static int write_battery_to_relay(struct peripheral_relay *relay,
@@ -185,10 +245,12 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
- * flush_dirty \u2014 push all pending battery data to a single relay.
+ * flush_dirty — push all pending battery data to a single relay.
  *
  * Dirty flag cleared ONLY on successful write.
- * Returns true if any dirty flags remain (bat_ready false or -ENOBUFS).
+ * Source > 0 (right battery) is also subject to the idle gate here, so
+ * that the periodic retry work and post-discovery push don’t bypass it.
+ * Returns true if any dirty flags remain.
  * ---------------------------------------------------------------------- */
 
 static bool flush_dirty(struct peripheral_relay *relay)
@@ -207,6 +269,11 @@ static bool flush_dirty(struct peripheral_relay *relay)
 
     for (int src = 0; src < (int)ARRAY_SIZE(battery_cache); src++) {
         if (!relay->bat_dirty[src]) continue;
+        /* Right-battery sources (src > 0) are idle-gated */
+        if (src > 0 && !both_shields_idle_enough()) {
+            still_dirty = true;
+            continue;
+        }
         if (write_battery_to_relay(relay, (uint8_t)src, battery_cache[src]) == 0) {
             relay->bat_dirty[src] = false;
         } else {
@@ -235,7 +302,7 @@ static bool flush_dirty(struct peripheral_relay *relay)
  *
  * 1. For any relay that is connected, has no characteristic yet, and has not
  *    confirmed absence (discovery_gave_up == false), re-schedule discovery.
- *    This recovers from exhausted initial retries due to ZMK\u2019s concurrent
+ *    This recovers from exhausted initial retries due to ZMK’s concurrent
  *    GATT operations at connection time.  discovery_gave_up prevents
  *    re-hammering peripherals that genuinely lack the relay service.
  *
@@ -254,7 +321,7 @@ static void bat_relay_retry_handler(struct k_work *work)
          * Re-attempt GATT discovery if:
          *  - peripheral is connected
          *  - characteristic not yet found
-         *  - server has NOT already replied \u201cnot found\u201d (discovery_gave_up)
+         *  - server has NOT already replied “not found” (discovery_gave_up)
          *  - no discovery already pending
          */
         if (relay->conn != NULL && !relay->bat_ready &&
@@ -273,12 +340,27 @@ static void bat_relay_retry_handler(struct k_work *work)
 }
 
 /* -------------------------------------------------------------------------
- * broadcast_battery \u2014 write to all relays, mark dirty on failure.
+ * broadcast_battery — write to all relays, mark dirty on failure.
+ *
+ * Source 0 (left battery) and dongle battery relay immediately.
+ * Source > 0 (right battery) is idle-gated: if both shields have not been
+ * idle for RIGHT_BAT_IDLE_THRESHOLD_MS the write is deferred by marking
+ * dirty and scheduling right_bat_idle_work.
  * ---------------------------------------------------------------------- */
 
 static void broadcast_battery(uint8_t source, uint8_t level)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
+        /* Non-left-battery sources (right shield, etc.) need the idle gate */
+        if (source > 0 && source != BATTERY_RELAY_SOURCE_DONGLE) {
+            if (!both_shields_idle_enough()) {
+                if (source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
+                    relays[i].bat_dirty[source] = true;
+                }
+                schedule_right_bat_idle_flush();
+                continue;
+            }
+        }
         int err = write_battery_to_relay(&relays[i], source, level);
         if (err != 0 && source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
             relays[i].bat_dirty[source] = true;
@@ -287,8 +369,9 @@ static void broadcast_battery(uint8_t source, uint8_t level)
 }
 
 /* -------------------------------------------------------------------------
- * push_cached_state \u2014 called once after GATT discovery succeeds.
+ * push_cached_state — called once after GATT discovery succeeds.
  * Marks all cached sources dirty and flushes immediately.
+ * Source > 0 dirty flags will be held by flush_dirty until idle.
  * ---------------------------------------------------------------------- */
 
 static void push_cached_state(struct peripheral_relay *relay)
@@ -305,6 +388,9 @@ static void push_cached_state(struct peripheral_relay *relay)
 #endif
 
     flush_dirty(relay);
+
+    /* Schedule idle flush in case src>0 was gated */
+    schedule_right_bat_idle_flush();
 
     /* Layer relay DISABLED: write_layer_to_relay(relay, layer_cache); */
 }
@@ -330,7 +416,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
                                        (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
             } else {
                 /*
-                 * ATT discovery completed and the server replied \u201cnot found\u201d
+                 * ATT discovery completed and the server replied “not found”
                  * after all retries.  Mark gave_up so the periodic retry
                  * work does not repeatedly re-discover on this connection
                  * (which would spam ATT and disrupt keystroke traffic on
@@ -508,6 +594,23 @@ static int relay_central_event_handler(const zmk_event_t *eh)
     }
 #endif
 
+    const struct zmk_activity_state_changed *act_ev = as_zmk_activity_state_changed(eh);
+    if (act_ev) {
+        if (act_ev->state == ZMK_ACTIVITY_ACTIVE) {
+            last_active_ms = k_uptime_get();
+            /*
+             * Cancel the scheduled idle flush — dirty flags are preserved
+             * intentionally so the next idle window can flush them.
+             * Do NOT clear dirty flags here (fixes IDLE→ACTIVE purge issue).
+             */
+            k_work_cancel_delayable(&right_bat_idle_work);
+        } else {
+            /* IDLE or SLEEP: schedule flush after threshold */
+            schedule_right_bat_idle_flush();
+        }
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
     /*
      * Layer relay DISABLED:
      *
@@ -526,6 +629,7 @@ static int relay_central_event_handler(const zmk_event_t *eh)
 
 ZMK_LISTENER(battery_relay_central, relay_central_event_handler);
 ZMK_SUBSCRIPTION(battery_relay_central, zmk_peripheral_battery_state_changed);
+ZMK_SUBSCRIPTION(battery_relay_central, zmk_activity_state_changed);
 /* Layer relay DISABLED:
  * ZMK_SUBSCRIPTION(battery_relay_central, zmk_layer_state_changed);
  */
