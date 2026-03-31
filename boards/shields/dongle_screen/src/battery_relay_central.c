@@ -574,20 +574,33 @@ static int relay_central_event_handler(const zmk_event_t *eh)
     const struct zmk_peripheral_battery_state_changed *periph_ev =
         as_zmk_peripheral_battery_state_changed(eh);
     if (periph_ev) {
-        LOG_INF("relay_central: peripheral battery source=%u level=%u",
-                periph_ev->source, periph_ev->state_of_charge);
-        if (periph_ev->source < (uint8_t)ARRAY_SIZE(battery_cache)) {
-            battery_cache[periph_ev->source] = periph_ev->state_of_charge;
+        if (periph_ev->source >= (uint8_t)ARRAY_SIZE(battery_cache)) {
+            return ZMK_EV_EVENT_BUBBLE;
         }
-        broadcast_battery(periph_ev->source, periph_ev->state_of_charge);
+
+        uint8_t old_level = battery_cache[periph_ev->source];
+        uint8_t new_level = periph_ev->state_of_charge;
+        if (old_level == new_level) {
+            /* Ignore duplicate values to avoid relay feedback/rebroadcast loops. */
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+
+        LOG_INF("relay_central: peripheral battery source=%u %u->%u",
+                periph_ev->source, old_level, new_level);
+        battery_cache[periph_ev->source] = new_level;
+        broadcast_battery(periph_ev->source, new_level);
         return ZMK_EV_EVENT_BUBBLE;
     }
 
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     const struct zmk_battery_state_changed *bat_ev = as_zmk_battery_state_changed(eh);
     if (bat_ev) {
-        dongle_battery_cache = bat_ev->state_of_charge;
-        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, bat_ev->state_of_charge);
+        uint8_t new_level = bat_ev->state_of_charge;
+        if (dongle_battery_cache == new_level) {
+            return ZMK_EV_EVENT_BUBBLE;
+        }
+        dongle_battery_cache = new_level;
+        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, new_level);
         return ZMK_EV_EVENT_BUBBLE;
     }
 #endif
