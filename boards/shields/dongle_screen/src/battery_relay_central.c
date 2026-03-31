@@ -137,7 +137,6 @@ struct peripheral_relay {
 
 /* How often the retry work polls for pending dirty writes. */
 #define BAT_RELAY_RETRY_MS             5000
-#define BAT_RELAY_FAST_RETRY_MS        300
 #define BAT_RELAY_WRITE_SPACING_MS     40
 
 /*
@@ -312,7 +311,7 @@ static void relay_write_complete_cb(struct bt_conn *conn, void *user_data)
     }
 
     relay->write_in_flight = false;
-    k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
+    k_work_schedule(&bat_relay_retry_work, K_MSEC(1000));
 }
 
 static void bat_relay_retry_handler(struct k_work *work)
@@ -337,9 +336,7 @@ static void bat_relay_retry_handler(struct k_work *work)
                                    (uint32_t)i * RELAY_DISCOVERY_STAGGER_MS));
         }
 
-        if (flush_dirty(relay)) {
-            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
-        }
+        flush_dirty(relay);
     }
     k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
@@ -359,13 +356,11 @@ static void broadcast_battery(uint8_t source, uint8_t level)
             if (source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
                 relays[i].bat_dirty[source] = true;
             }
-            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
             continue;
         }
         int err = write_battery_to_relay(&relays[i], source, level);
         if (err != 0 && source < (uint8_t)ARRAY_SIZE(relays[i].bat_dirty)) {
             relays[i].bat_dirty[source] = true;
-            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
         }
     }
 }
@@ -389,9 +384,7 @@ static void push_cached_state(struct peripheral_relay *relay)
     }
 #endif
 
-    if (flush_dirty(relay)) {
-        k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
-    }
+    flush_dirty(relay);
 
     /* Layer relay DISABLED: write_layer_to_relay(relay, layer_cache); */
 }
@@ -604,7 +597,7 @@ static int relay_central_event_handler(const zmk_event_t *eh)
         if (act_ev->state == ZMK_ACTIVITY_ACTIVE) {
             last_active_ms = k_uptime_get();
         } else {
-            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
+            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
         }
         return ZMK_EV_EVENT_BUBBLE;
     }
