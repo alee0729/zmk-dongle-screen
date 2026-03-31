@@ -206,14 +206,14 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
- * Activity gate for battery relay
+ * Idle gate for right-battery relay
  *
- * All battery relay writes are held for RIGHT_BAT_ACTIVE_GUARD_MS after
- * recent activity to reduce ATT contention with split HID traffic.
+ * Source > 0 (right-side split sources) is relayed only while shields are
+ * truly idle (activity state IDLE/SLEEP). This avoids BLE overload during
+ * typing and only flushes right-battery data once traffic is quiet.
  * ---------------------------------------------------------------------- */
 
-static int64_t last_active_ms = 0;
-#define RIGHT_BAT_ACTIVE_GUARD_MS 1500
+static bool shields_idle = true;
 
 /* Forward declarations needed before K_WORK_DELAYABLE_DEFINE */
 static bool flush_dirty(struct peripheral_relay *relay);
@@ -223,7 +223,7 @@ static bool source_write_allowed(uint8_t source);
  * flush_dirty — push all pending battery data to a single relay.
  *
  * Dirty flag cleared ONLY on successful write.
- * Source > 0 (right battery) is also subject to the activity-aware gate.
+ * Source > 0 (right battery) is subject to the true-idle gate.
  * Returns true if any dirty flags remain.
  * ---------------------------------------------------------------------- */
 
@@ -280,8 +280,10 @@ static bool flush_dirty(struct peripheral_relay *relay)
 
 static bool source_write_allowed(uint8_t source)
 {
-    ARG_UNUSED(source);
-    return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_ACTIVE_GUARD_MS;
+    if (source > 0 && source != BATTERY_RELAY_SOURCE_DONGLE) {
+        return shields_idle;
+    }
+    return true;
 }
 
 /* -------------------------------------------------------------------------
@@ -608,9 +610,10 @@ static int relay_central_event_handler(const zmk_event_t *eh)
     const struct zmk_activity_state_changed *act_ev = as_zmk_activity_state_changed(eh);
     if (act_ev) {
         if (act_ev->state == ZMK_ACTIVITY_ACTIVE) {
-            last_active_ms = k_uptime_get();
+            shields_idle = false;
         } else {
-            k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
+            shields_idle = true;
+            k_work_schedule(&bat_relay_retry_work, K_MSEC(200));
         }
         return ZMK_EV_EVENT_BUBBLE;
     }
