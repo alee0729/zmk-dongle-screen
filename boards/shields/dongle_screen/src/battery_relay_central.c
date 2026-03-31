@@ -28,13 +28,11 @@
  * A 5-second periodic retry work item (bat_relay_retry_work) flushes any
  * remaining dirty writes, handling transient -ENOBUFS failures automatically.
  *
- * Activity-aware gate for right-battery relay
- * -------------------------------------------
- * Source 0 (left battery) and BATTERY_RELAY_SOURCE_DONGLE (dongle battery)
- * are relayed immediately. Source > 0 (right battery) is deferred only while
- * there has been very recent keyboard activity, and is retried soon after.
- * This keeps right-side battery updates flowing to the left shield without
- * saturating ATT during active typing bursts.
+ * Activity-aware relay + serialized ATT writes
+ * ---------------------------------------------
+ * Battery relay writes are deferred briefly after activity and are serialized
+ * (single in-flight write per peripheral). This minimizes contention with
+ * split HID traffic and avoids queue bursts that can lock up keyboard input.
  *
  * Discovery recovery
  * ------------------
@@ -127,6 +125,8 @@ struct peripheral_relay {
     struct k_work_delayable         discovery_work;
     uint8_t                         discover_retries;
     int64_t                         last_write_ms;
+    bool                            write_in_flight;
+    struct battery_relay_data       tx_buf;
 };
 
 #define RELAY_DISCOVERY_DELAY_MS       2000
@@ -175,17 +175,26 @@ static int get_relay_index(const struct peripheral_relay *relay)
  * Write helper — returns 0 on success, negative errno on failure.
  * ---------------------------------------------------------------------- */
 
+static void relay_write_complete_cb(struct bt_conn *conn, void *user_data);
+
 static int write_battery_to_relay(struct peripheral_relay *relay,
                                    uint8_t source, uint8_t level)
 {
     if (!relay->bat_ready || relay->conn == NULL) {
         return -ENOTCONN;
     }
-    struct battery_relay_data data = { .source = source, .level = level };
-    int err = bt_gatt_write_without_response(relay->conn, relay->bat_char_handle,
-                                             &data, sizeof(data), false);
+    if (relay->write_in_flight) {
+        return -EAGAIN;
+    }
+
+    relay->tx_buf = (struct battery_relay_data){ .source = source, .level = level };
+    int err = bt_gatt_write_without_response_cb(relay->conn, relay->bat_char_handle,
+                                                &relay->tx_buf, sizeof(relay->tx_buf),
+                                                false, relay_write_complete_cb, relay);
     if (err) {
         LOG_WRN("battery_relay: write src=%u failed: %d", source, err);
+    } else {
+        relay->write_in_flight = true;
     }
     return err;
 }
@@ -198,11 +207,10 @@ static int write_battery_to_relay(struct peripheral_relay *relay,
  */
 
 /* -------------------------------------------------------------------------
- * Activity gate for right-battery relay
+ * Activity gate for battery relay
  *
- * Source 0 (left battery) and dongle battery relay immediately.
- * Source > 0 (right battery) is held only for RIGHT_BAT_ACTIVE_GUARD_MS
- * after recent activity to avoid competing with HID traffic.
+ * All battery relay writes are held for RIGHT_BAT_ACTIVE_GUARD_MS after
+ * recent activity to reduce ATT contention with split HID traffic.
  * ---------------------------------------------------------------------- */
 
 static int64_t last_active_ms = 0;
@@ -273,9 +281,7 @@ static bool flush_dirty(struct peripheral_relay *relay)
 
 static bool source_write_allowed(uint8_t source)
 {
-    if (source == BATTERY_RELAY_SOURCE_DONGLE || source == 0) {
-        return true;
-    }
+    ARG_UNUSED(source);
     return (k_uptime_get() - last_active_ms) >= RIGHT_BAT_ACTIVE_GUARD_MS;
 }
 
@@ -295,6 +301,19 @@ static bool source_write_allowed(uint8_t source)
 
 static void bat_relay_retry_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(bat_relay_retry_work, bat_relay_retry_handler);
+
+static void relay_write_complete_cb(struct bt_conn *conn, void *user_data)
+{
+    ARG_UNUSED(conn);
+
+    struct peripheral_relay *relay = user_data;
+    if (!relay) {
+        return;
+    }
+
+    relay->write_in_flight = false;
+    k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_FAST_RETRY_MS));
+}
 
 static void bat_relay_retry_handler(struct k_work *work)
 {
@@ -514,6 +533,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
     relay->discovery_gave_up = false;
     relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
     relay->last_write_ms = 0;
+    relay->write_in_flight = false;
     memset(relay->bat_dirty, 0, sizeof(relay->bat_dirty));
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     relay->dongle_bat_dirty = false;
@@ -543,6 +563,7 @@ static void relay_disconnected(struct bt_conn *conn, uint8_t reason)
     relay->bat_ready       = false;
     relay->bat_char_handle = 0;
     relay->last_write_ms   = 0;
+    relay->write_in_flight = false;
     /* Layer relay DISABLED: relay->layer_ready = false; */
 }
 
