@@ -133,14 +133,13 @@ struct peripheral_relay {
     uint8_t                         discover_retries;
 };
 
-#define RELAY_DISCOVERY_DELAY_MS       2000
-#define RELAY_DISCOVERY_STAGGER_MS     2000
+#define RELAY_DISCOVERY_DELAY_MS       20000
+#define RELAY_DISCOVERY_STAGGER_MS     5000
 #define RELAY_DISCOVERY_MAX_RETRIES    5
-#define RELAY_DISCOVERY_RETRY_DELAY_MS 2000
-#define RELAY_PERIODIC_BROADCAST_MS    60000
+#define RELAY_DISCOVERY_RETRY_DELAY_MS 5000
 
 /* How often the retry work polls for pending dirty writes. */
-#define BAT_RELAY_RETRY_MS             5000
+#define BAT_RELAY_RETRY_MS             30000
 
 /*
  * How long to wait before re-attempting GATT discovery from the periodic
@@ -321,26 +320,7 @@ K_WORK_DELAYABLE_DEFINE(bat_relay_retry_work, bat_relay_retry_handler);
 static void bat_relay_retry_handler(struct k_work *work)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-        struct peripheral_relay *relay = &relays[i];
-
-        /*
-         * Re-attempt GATT discovery if:
-         *  - peripheral is connected
-         *  - characteristic not yet found
-         *  - server has NOT already replied “not found” (discovery_gave_up)
-         *  - no discovery already pending
-         */
-        if (relay->conn != NULL && !relay->bat_ready &&
-            !relay->discovery_gave_up &&
-            !k_work_delayable_is_pending(&relay->discovery_work)) {
-            LOG_INF("battery_relay[%d]: re-scheduling discovery", i);
-            relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
-            k_work_schedule(&relay->discovery_work,
-                            K_MSEC(BAT_RELAY_REDISCOVER_DELAY_MS +
-                                   (uint32_t)i * RELAY_DISCOVERY_STAGGER_MS));
-        }
-
-        flush_dirty(relay);
+        flush_dirty(&relays[i]);
     }
     k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
@@ -468,12 +448,10 @@ static void start_battery_discovery(struct peripheral_relay *relay)
             k_work_schedule(&relay->discovery_work,
                             K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
                                    (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
+        } else {
+            /* exhausted — stop retrying to protect BLE traffic */
+            relay->discovery_gave_up = true;
         }
-        /*
-         * On non-transient errors or exhausted retries: discovery_gave_up
-         * stays false so the periodic retry work will re-attempt later.
-         */
-    }
 }
 
 static void discovery_work_handler(struct k_work *work)
