@@ -105,7 +105,7 @@ struct peripheral_relay {
     bool     bat_ready;
 
     /*
-     * Set when discovery completed but the relay characteristic was not
+     * Set when ATT discovery completed but the relay characteristic was not
      * found on this peripheral (i.e. the server responded “not found”).
      * The periodic retry work skips re-discovery for this relay to avoid
      * spamming the ATT channel of peripherals without the relay service
@@ -113,6 +113,22 @@ struct peripheral_relay {
      * Reset to false on each new connection.
      */
     bool     discovery_gave_up;
+
+    /*
+     * Set the first time battery_discover_func is invoked, i.e. the moment
+     * bt_gatt_discover() returned 0 and ATT-level discovery actually ran.
+     * Until this flag is set, all failures have been transient call-level
+     * errors (-EBUSY/-ENOMEM) that never reached the ATT bearer.
+     *
+     * The periodic retry work uses this to decide whether to re-schedule
+     * discovery:
+     *   - false  →  ATT never ran (pure EBUSY); safe to retry, no ATT
+     *               traffic generated yet.
+     *   - true   →  ATT ran at least once; the callback's own retry/
+     *               gave_up logic handles everything from here.
+     * Reset to false on each new connection.
+     */
+    bool     discovery_att_started;
 
     /* Layer relay DISABLED: bool layer_ready; */
 
@@ -324,21 +340,17 @@ static void bat_relay_retry_handler(struct k_work *work)
         struct peripheral_relay *relay = &relays[i];
 
         /*
-         * Re-attempt GATT discovery if:
-         *  - peripheral is connected
-         *  - characteristic not yet found
-         *  - server has NOT already replied "not found" (discovery_gave_up)
-         *  - no discovery already pending
-         *
-         * discovery_gave_up is only set by battery_discover_func when the
-         * ATT bearer completes and the server says "not found" (right shield
-         * case).  For the left shield the discovery will succeed, so
-         * discovery_gave_up is never set and we keep retrying here until it
-         * does.  BAT_RELAY_REDISCOVER_DELAY_MS gives ZMK's GATT operations
-         * time to settle before each re-attempt.
+         * Re-attempt GATT discovery ONLY when:
+         *  - peripheral is connected and characteristic not yet found
+         *  - ATT-level discovery has never started (!discovery_att_started)
+         *    — i.e. all previous attempts returned -EBUSY/-ENOMEM before
+         *    reaching the ATT bearer.  Once ATT starts, battery_discover_func
+         *    owns the retry/gave_up cycle; we must not interfere or we risk
+         *    flooding the right shield with extra ATT requests.
+         *  - no discovery work already pending / running
          */
         if (relay->conn != NULL && !relay->bat_ready &&
-            !relay->discovery_gave_up &&
+            !relay->discovery_att_started &&
             !k_work_delayable_is_pending(&relay->discovery_work)) {
             LOG_INF("battery_relay[%d]: re-scheduling discovery from retry handler", i);
             relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
@@ -419,6 +431,13 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
     struct peripheral_relay *relay =
         CONTAINER_OF(params, struct peripheral_relay, discover_params);
     int idx = get_relay_index(relay);
+
+    /*
+     * Mark that ATT-level discovery has run at least once.  From this point
+     * the callback's own retry/gave_up logic controls everything, and the
+     * periodic retry work will no longer re-schedule discovery for this relay.
+     */
+    relay->discovery_att_started = true;
 
     if (!attr) {
         if (!relay->bat_ready) {
@@ -544,11 +563,12 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
         return;
     }
 
-    relay->conn             = bt_conn_ref(conn);
-    relay->bat_ready        = false;
-    relay->bat_char_handle  = 0;
-    relay->discovery_gave_up = false;
-    relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
+    relay->conn                  = bt_conn_ref(conn);
+    relay->bat_ready             = false;
+    relay->bat_char_handle       = 0;
+    relay->discovery_gave_up     = false;
+    relay->discovery_att_started = false;
+    relay->discover_retries      = RELAY_DISCOVERY_MAX_RETRIES;
     memset(relay->bat_dirty, 0, sizeof(relay->bat_dirty));
 #if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
     relay->dongle_bat_dirty = false;
