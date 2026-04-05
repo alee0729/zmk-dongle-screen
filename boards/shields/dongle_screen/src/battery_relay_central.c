@@ -137,6 +137,7 @@ struct peripheral_relay {
 #define RELAY_DISCOVERY_STAGGER_MS     5000
 #define RELAY_DISCOVERY_MAX_RETRIES    5
 #define RELAY_DISCOVERY_RETRY_DELAY_MS 5000
+#define RELAY_PERIODIC_BROADCAST_MS    60000
 
 /* How often the retry work polls for pending dirty writes. */
 #define BAT_RELAY_RETRY_MS             30000
