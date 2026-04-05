@@ -455,7 +455,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
              * disconnection/reconnection resets discovery and gives a fresh
              * chance.
              */
-            LOG_INF(“battery_relay[%d]: characteristic not found — giving up”, idx);
+            LOG_INF(“battery_relay[%d]: characteristic not found, giving up”, idx);
             relay->discovery_gave_up = true;
         }
         return BT_GATT_ITER_STOP;
