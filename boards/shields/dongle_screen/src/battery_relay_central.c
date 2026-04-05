@@ -321,7 +321,33 @@ K_WORK_DELAYABLE_DEFINE(bat_relay_retry_work, bat_relay_retry_handler);
 static void bat_relay_retry_handler(struct k_work *work)
 {
     for (int i = 0; i < (int)ARRAY_SIZE(relays); i++) {
-        flush_dirty(&relays[i]);
+        struct peripheral_relay *relay = &relays[i];
+
+        /*
+         * Re-attempt GATT discovery if:
+         *  - peripheral is connected
+         *  - characteristic not yet found
+         *  - server has NOT already replied "not found" (discovery_gave_up)
+         *  - no discovery already pending
+         *
+         * discovery_gave_up is only set by battery_discover_func when the
+         * ATT bearer completes and the server says "not found" (right shield
+         * case).  For the left shield the discovery will succeed, so
+         * discovery_gave_up is never set and we keep retrying here until it
+         * does.  BAT_RELAY_REDISCOVER_DELAY_MS gives ZMK's GATT operations
+         * time to settle before each re-attempt.
+         */
+        if (relay->conn != NULL && !relay->bat_ready &&
+            !relay->discovery_gave_up &&
+            !k_work_delayable_is_pending(&relay->discovery_work)) {
+            LOG_INF("battery_relay[%d]: re-scheduling discovery from retry handler", i);
+            relay->discover_retries = RELAY_DISCOVERY_MAX_RETRIES;
+            k_work_schedule(&relay->discovery_work,
+                            K_MSEC(BAT_RELAY_REDISCOVER_DELAY_MS +
+                                   (uint32_t)i * RELAY_DISCOVERY_STAGGER_MS));
+        }
+
+        flush_dirty(relay);
     }
     k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
@@ -449,11 +475,17 @@ static void start_battery_discovery(struct peripheral_relay *relay)
             k_work_schedule(&relay->discovery_work,
                             K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
                                    (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
-        } else {
-            /* exhausted — stop retrying to protect BLE traffic */
-            relay->discovery_gave_up = true;
         }
-    }   
+        /*
+         * On non-transient errors or exhausted retries: discovery_gave_up
+         * stays false so the periodic retry work will re-attempt later.
+         * Only battery_discover_func sets discovery_gave_up — and only when
+         * the ATT bearer has completed discovery and the server replied
+         * "not found".  This prevents ATT spam on peripherals that genuinely
+         * lack the relay service (e.g. the right shield) while still allowing
+         * recovery for the left shield if the initial attempts hit EBUSY.
+         */
+    }
 }
 
 static void discovery_work_handler(struct k_work *work)
