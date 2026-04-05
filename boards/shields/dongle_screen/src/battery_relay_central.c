@@ -51,8 +51,8 @@
  * -EBUSY, exhausting the initial retries before our discovery ever starts.
  * The periodic retry work detects this and re-schedules discovery every
  * BAT_RELAY_REDISCOVER_DELAY_MS — BUT ONLY when the discovery callback
- * never reported “not found” (discovery_gave_up == false).  If the ATT bearer
- * already completed a discovery and the server replied “no such attribute”,
+ * never reported "not found" (discovery_gave_up == false).  If the ATT bearer
+ * already completed a discovery and the server replied "no such attribute",
  * it means the relay service is genuinely absent on that peripheral (e.g. the
  * right shield has no display) and we stop trying so we don’t spam its ATT
  * channel and disrupt keystroke traffic.
@@ -106,7 +106,7 @@ struct peripheral_relay {
 
     /*
      * Set when ATT discovery completed but the relay characteristic was not
-     * found on this peripheral (i.e. the server responded “not found”).
+     * found on this peripheral (i.e. the server responded "not found").
      * The periodic retry work skips re-discovery for this relay to avoid
      * spamming the ATT channel of peripherals without the relay service
      * (e.g. the right shield).
@@ -441,7 +441,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
     if (!attr) {
         if (!relay->bat_ready) {
             /*
-             * ATT discovery completed: the server replied “not found”.
+             * ATT discovery completed: the server replied "not found".
              * Give up immediately — no retries.
              *
              * bt_gatt_discover() on a stable connection reliably finds or
@@ -455,7 +455,7 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
              * disconnection/reconnection resets discovery and gives a fresh
              * chance.
              */
-            LOG_INF(“battery_relay[%d]: characteristic not found, giving up”, idx);
+            LOG_INF("battery_relay[%d]: characteristic not found, giving up", idx);
             relay->discovery_gave_up = true;
         }
         return BT_GATT_ITER_STOP;
