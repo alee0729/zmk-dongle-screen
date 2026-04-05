@@ -452,6 +452,7 @@ static void start_battery_discovery(struct peripheral_relay *relay)
             /* exhausted — stop retrying to protect BLE traffic */
             relay->discovery_gave_up = true;
         }
+    }   
 }
 
 static void discovery_work_handler(struct k_work *work)
