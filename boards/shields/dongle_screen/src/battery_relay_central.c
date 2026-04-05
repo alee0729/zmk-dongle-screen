@@ -153,7 +153,6 @@ struct peripheral_relay {
 #define RELAY_DISCOVERY_STAGGER_MS     5000
 #define RELAY_DISCOVERY_MAX_RETRIES    5
 #define RELAY_DISCOVERY_RETRY_DELAY_MS 5000
-#define RELAY_PERIODIC_BROADCAST_MS    60000
 
 /* How often the retry work polls for pending dirty writes. */
 #define BAT_RELAY_RETRY_MS             30000
@@ -441,23 +440,23 @@ static uint8_t battery_discover_func(struct bt_conn *conn,
 
     if (!attr) {
         if (!relay->bat_ready) {
-            if (relay->discover_retries > 0) {
-                relay->discover_retries--;
-                k_work_schedule(&relay->discovery_work,
-                                K_MSEC(RELAY_DISCOVERY_RETRY_DELAY_MS +
-                                       (uint32_t)idx * RELAY_DISCOVERY_STAGGER_MS));
-            } else {
-                /*
-                 * ATT discovery completed and the server replied “not found”
-                 * after all retries.  Mark gave_up so the periodic retry
-                 * work does not repeatedly re-discover on this connection
-                 * (which would spam ATT and disrupt keystroke traffic on
-                 * peripherals without the relay service).
-                 */
-                LOG_INF("battery_relay[%d]: characteristic not found, stopping retries",
-                        idx);
-                relay->discovery_gave_up = true;
-            }
+            /*
+             * ATT discovery completed: the server replied “not found”.
+             * Give up immediately — no retries.
+             *
+             * bt_gatt_discover() on a stable connection reliably finds or
+             * fails to find the characteristic in a single round.  The right
+             * shield genuinely has no relay service, so every retry would
+             * generate unnecessary ATT traffic on that connection, which is
+             * precisely the traffic that causes keystroke disruption.
+             * The left shield will find the characteristic on the first try.
+             *
+             * If spurious failure ever occurs (extreme packet loss), the next
+             * disconnection/reconnection resets discovery and gives a fresh
+             * chance.
+             */
+            LOG_INF(“battery_relay[%d]: characteristic not found — giving up”, idx);
+            relay->discovery_gave_up = true;
         }
         return BT_GATT_ITER_STOP;
     }
@@ -522,28 +521,22 @@ static void discovery_work_handler(struct k_work *work)
     }
 }
 
-/* -------------------------------------------------------------------------
- * Periodic re-broadcast
- * ---------------------------------------------------------------------- */
-
-static void periodic_broadcast_handler(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(periodic_broadcast_work, periodic_broadcast_handler);
-
-static void periodic_broadcast_handler(struct k_work *work)
-{
-    for (int src = 0; src < (int)ARRAY_SIZE(battery_cache); src++) {
-        if (battery_cache[src] > 0) {
-            broadcast_battery((uint8_t)src, battery_cache[src]);
-        }
-    }
-#if IS_ENABLED(CONFIG_ZMK_DONGLE_DISPLAY_DONGLE_BATTERY)
-    if (dongle_battery_cache > 0) {
-        broadcast_battery(BATTERY_RELAY_SOURCE_DONGLE, dongle_battery_cache);
-    }
-#endif
-    /* Layer relay DISABLED: broadcast_layer(layer_cache); */
-    k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
-}
+/*
+ * Periodic re-broadcast was removed.
+ *
+ * Rationale: broadcast_battery() for source 0 bypasses the idle gate, so a
+ * periodic timer writing source 0 unconditionally was generating GATT writes
+ * during active typing — competing with keystroke notifications and causing
+ * the observed "dongle freeze after idle" lockup.
+ *
+ * Redundancy is already provided by:
+ *   • dirty flags set on every failed write and flushed by bat_relay_retry_work
+ *   • push_cached_state() called immediately after each discovery success
+ *   • broadcast_battery() on every zmk_peripheral_battery_state_changed event
+ *
+ * Battery levels change at most a few times per hour; one reliable write per
+ * event is sufficient.
+ */
 
 /* -------------------------------------------------------------------------
  * BT connection callbacks
@@ -581,8 +574,7 @@ static void relay_connected(struct bt_conn *conn, uint8_t conn_err)
                      (uint32_t)get_relay_index(relay) * RELAY_DISCOVERY_STAGGER_MS;
     k_work_schedule(&relay->discovery_work, K_MSEC(delay));
 
-    /* Start the background work items (no-op if already running). */
-    k_work_schedule(&periodic_broadcast_work, K_MSEC(RELAY_PERIODIC_BROADCAST_MS));
+    /* Start the periodic dirty-flush work (no-op if already running). */
     k_work_schedule(&bat_relay_retry_work, K_MSEC(BAT_RELAY_RETRY_MS));
 }
 
